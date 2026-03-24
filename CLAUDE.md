@@ -31,9 +31,9 @@ discarded when the response completes.
 
 | Contract | Path | Role in this project |
 |----------|------|----------------------|
-| Architecture Contract | `../tekmar-infrastructure/contracts/architecture.md` | System overview, Pipeline Service responsibilities (section 4.3), credential transit (section 6), and invariants #3, #4, #5, #6, #7 which all govern this service directly. |
-| Internal API | `../tekmar-infrastructure/contracts/internal-api.yaml` | **Implements this contract.** Defines the three HTTP endpoints this service serves (`POST /interpret`, `POST /execute`, `GET /health`), the NDJSON streaming protocol for both /interpret and /execute, all stream event types, the result_data schema, and the query lifecycle state transitions. |
-| MCP Tool Interface | `../tekmar-infrastructure/contracts/mcp-tool-interface.yaml` | **Core operational contract.** Defines the tool_catalog schema (section 1) that the Interpreter receives, the query_plan and plan_step schemas (section 2) that the Interpreter produces and the Execution Engine consumes, the tool_invocation_request and tool_invocation_response schemas (section 3) for MCP tool calls, the credential_envelope format for passing credentials to MCP servers, and the transparency_log schema (section 4) that the Execution Engine produces. |
+| Architecture Contract | `../tekmartech-infrastructure/contracts/architecture.md` | System overview, Pipeline Service responsibilities (section 4.3), credential transit (section 6), and invariants #3, #4, #5, #6, #7 which all govern this service directly. |
+| Internal API | `../tekmartech-infrastructure/contracts/internal-api.yaml` | **Implements this contract.** Defines the three HTTP endpoints this service serves (`POST /interpret`, `POST /execute`, `GET /health`), the NDJSON streaming protocol for both /interpret and /execute, all stream event types, the result_data schema, and the query lifecycle state transitions. |
+| MCP Tool Interface | `../tekmartech-infrastructure/contracts/mcp-tool-interface.yaml` | **Core operational contract.** Defines the tool_catalog schema (section 1) that the Interpreter receives, the query_plan and plan_step schemas (section 2) that the Interpreter produces and the Execution Engine consumes, the tool_invocation_request and tool_invocation_response schemas (section 3) for MCP tool calls, the credential_envelope format for passing credentials to MCP servers, and the transparency_log schema (section 4) that the Execution Engine produces. |
 
 This service does NOT reference `public-api.yaml` (it does not know about
 the public API) or `data-model.yaml` (it does not access the database).
@@ -46,6 +46,7 @@ the public API) or `data-model.yaml` (it does not access the database).
 |---------|--------|
 | Framework | FastAPI |
 | Language | Python 3.11+ |
+| Package manager | uv |
 | ASGI server | Uvicorn |
 | LLM interaction | LLM provider abstraction layer supporting multiple backends |
 | LLM backends (MVP) | Anthropic API (Claude), OpenAI API (GPT), Ollama (local models) |
@@ -53,6 +54,7 @@ the public API) or `data-model.yaml` (it does not access the database).
 | Streaming | FastAPI StreamingResponse with NDJSON formatting |
 | HTTP client | httpx (async, for LLM API calls) |
 | Validation | Pydantic v2 models |
+| Logging | structlog (structured JSON logging) |
 | Testing | pytest + pytest-asyncio |
 
 ---
@@ -426,10 +428,44 @@ DEBUG level. Log credential_mode (broker/direct) and integration_id,
 but never the actual credential_data contents. This applies to all
 logging, including error logging.
 
-**Structured logging** — use Python's logging module with JSON-formatted
-output. Include query_id and step_id in log context for every log
-entry during query processing. This enables log correlation with the
-Application API's logs.
+**Structured logging** — use structlog for all application logging with
+JSON-formatted output. Configure structlog in `config.py` on startup.
+Every log entry must include: `level`, `message`, `module` (the Python
+module name), `action` (the operation being performed, e.g.,
+`parse_plan`, `invoke_tool`, `stream_delta`), and a context dict with
+`query_id` and `step_id` when available. Log at these levels:
+- `debug` — entering a method, parameters received, intermediate state.
+- `info` — successful completion of significant operations.
+- `warn` — recoverable failures, validation issues.
+- `error` — unrecoverable failures, unexpected exceptions.
+Every function should log at minimum: one debug entry on entry and one
+info or warn entry on completion. Never log credential values, tokens,
+or secrets — log identifiers only (integration_id, credential_mode).
+
+**File naming** — every Python file must use a descriptive name that
+communicates its role. Use snake_case for all file names. Pydantic model
+files go in `models/`. Route handler files go in `api/`. Test files use
+the `test_` prefix convention: `test_interpreter.py`,
+`test_execution_engine.py`. Never create generic files like `utils.py`
+or `helpers.py` — name them by what they do: `plan_parser.py`,
+`template_resolver.py`.
+
+**Docstrings** — add Google-style docstrings to all public functions,
+classes, and methods. Each docstring should describe what the function
+does, its arguments with types, its return type, and any exceptions it
+raises. Reference the contract schema it implements where applicable
+(e.g., "Conforms to the query_plan schema in mcp-tool-interface.yaml").
+
+**Testing** — every module must have corresponding tests. Write tests
+alongside implementation. Use pytest with pytest-asyncio for async tests.
+Mock external dependencies (LLM providers, MCP clients) using pytest
+fixtures. Test both success paths and error paths. For streaming
+endpoints, test that the correct sequence of NDJSON events is produced.
+
+**Package management** — use `uv` for all dependency management. The
+project uses `pyproject.toml` for dependency specification. Use
+`uv sync` to install dependencies, `uv add <package>` to add new
+packages, and `uv run pytest` to run tests. Do not use pip directly.
 
 **Error containment** — errors during a single step should not crash
 the entire execution. Catch step-level errors, emit a step_failed
