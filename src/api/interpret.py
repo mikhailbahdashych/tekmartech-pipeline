@@ -1,13 +1,9 @@
-"""POST /interpret endpoint with mock streaming implementation.
+"""POST /interpret endpoint with real LLM-powered interpretation.
 
-Validates the request, then streams NDJSON events simulating the
-interpretation flow: started → text deltas → plan generated.
+Validates the request, then streams NDJSON events as the LLM analyzes
+the query and produces a structured execution plan.
 Conforms to the /interpret endpoint defined in internal-api.yaml.
 """
-
-import asyncio
-from collections.abc import AsyncGenerator
-from datetime import UTC, datetime
 
 import structlog
 from fastapi import APIRouter, Request
@@ -15,14 +11,10 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from src.api.streaming import ndjson_stream_response
-from src.models.query_plan import PlanStep, QueryPlan
-from src.models.stream_events import (
-    InterpretationError,
-    InterpretationPlanGenerated,
-    InterpretationStarted,
-    InterpretationTextDelta,
-)
+from src.config import get_settings
+from src.models.query_plan import QueryPlan
 from src.models.tool_catalog import ToolCatalog
+from src.orchestrator.interpret_orchestrator import interpret_stream
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -44,108 +36,16 @@ class InterpretRequest(BaseModel):
     query_plan_templates: list[QueryPlan] | None = None
 
 
-def _now_iso() -> str:
-    """Return current UTC time as ISO 8601 string."""
-    return datetime.now(UTC).isoformat()
-
-
-async def _mock_interpret_stream(
-    request: InterpretRequest,
-) -> AsyncGenerator[BaseModel, None]:
-    """Generate mock interpretation NDJSON events.
-
-    Streams: interpretation_started → 3x text_delta → plan_generated.
-    Includes error handling to ensure a terminal event is always emitted.
+def _catalog_has_tools(request: InterpretRequest) -> bool:
+    """Check if the request's tool catalog contains at least one tool.
 
     Args:
         request: The validated interpretation request.
 
-    Yields:
-        Pydantic event models for NDJSON serialization.
+    Returns:
+        True if at least one integration has at least one tool.
     """
-    query_id = request.query_id
-
-    try:
-        logger.debug(
-            "starting mock interpretation",
-            action="interpret_stream",
-            query_id=query_id,
-        )
-
-        yield InterpretationStarted(
-            query_id=query_id,
-            timestamp=_now_iso(),
-        )
-
-        delta_texts = [
-            "Analyzing your query...",
-            "Identifying relevant tools...",
-            "Generating execution plan...",
-        ]
-        full_text = ""
-
-        for text in delta_texts:
-            await asyncio.sleep(0.1)
-            full_text += text + " "
-            yield InterpretationTextDelta(
-                query_id=query_id,
-                text_delta=text,
-                timestamp=_now_iso(),
-            )
-
-        mock_plan = QueryPlan(
-            plan_id="mock-plan-001",
-            plan_version="1.0",
-            steps=[
-                PlanStep(
-                    step_id="step_1",
-                    tool_name="aws.iam_list_users",
-                    integration_id="integration-001",
-                    parameters={"max_results": 1000},
-                    description="List all IAM users from the AWS account",
-                    output_alias="all_iam_users",
-                ),
-                PlanStep(
-                    step_id="step_2",
-                    tool_name="aws.iam_get_account_summary",
-                    integration_id="integration-001",
-                    parameters={},
-                    description="Get IAM account summary for MFA statistics",
-                    output_alias="account_summary",
-                ),
-            ],
-            estimated_tool_calls=2,
-            summary="Retrieve all IAM users and account summary to identify users without MFA.",
-        )
-
-        yield InterpretationPlanGenerated(
-            query_id=query_id,
-            query_plan=mock_plan,
-            plan_summary=mock_plan.summary,
-            estimated_duration_seconds=5,
-            full_interpretation_text=full_text.strip(),
-            timestamp=_now_iso(),
-        )
-
-        logger.info(
-            "mock interpretation completed",
-            action="interpret_stream",
-            query_id=query_id,
-        )
-
-    except Exception as exc:
-        logger.error(
-            "unexpected error during interpretation stream",
-            action="interpret_stream",
-            query_id=query_id,
-            error=str(exc),
-        )
-        yield InterpretationError(
-            query_id=query_id,
-            error_code="interpretation.internal_error",
-            error_message=f"Internal error during interpretation: {exc}",
-            timestamp=_now_iso(),
-        )
+    return any(len(integration.tools) > 0 for integration in request.tool_catalog.integrations)
 
 
 @router.post("/interpret")
@@ -154,6 +54,10 @@ async def interpret(request: Request) -> JSONResponse:
 
     Validates the request body before streaming. Returns a 400 JSON
     error for invalid requests, or a 200 NDJSON stream for valid ones.
+
+    Pre-stream validation:
+    - Request body must be valid JSON with required fields
+    - Tool catalog must contain at least one tool
 
     Args:
         request: The incoming FastAPI request.
@@ -205,10 +109,35 @@ async def interpret(request: Request) -> JSONResponse:
             },
         )
 
+    # Pre-stream validation: catalog must contain tools
+    if not interpret_request.tool_catalog.integrations or not _catalog_has_tools(interpret_request):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "code": "interpretation.invalid_catalog",
+                    "message": "Tool catalog is empty or contains no valid "
+                    "tool definitions. Cannot generate a plan.",
+                    "stage": "interpretation",
+                }
+            },
+        )
+
     logger.info(
         "interpret request validated, starting stream",
         action="interpret_validate",
         query_id=interpret_request.query_id,
     )
 
-    return ndjson_stream_response(_mock_interpret_stream(interpret_request))
+    provider = request.app.state.llm_provider
+    settings = get_settings()
+
+    return ndjson_stream_response(
+        interpret_stream(
+            query_id=interpret_request.query_id,
+            query_text=interpret_request.query_text,
+            tool_catalog=interpret_request.tool_catalog,
+            provider=provider,
+            settings=settings,
+        )
+    )

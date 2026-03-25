@@ -28,6 +28,11 @@ async def lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
         application: The FastAPI application instance.
     """
     settings = get_settings()
+
+    from src.llm.factory import create_llm_provider
+
+    application.state.llm_provider = create_llm_provider(settings)
+
     logger.info(
         "pipeline service started",
         action="startup",

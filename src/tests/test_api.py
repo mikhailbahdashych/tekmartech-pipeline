@@ -11,12 +11,67 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
+from src.llm.provider import LLMProvider
 from src.main import app
+
+# =============================================================================
+# Mock LLM provider for API tests
+# =============================================================================
+
+MOCK_PLAN_JSON = json.dumps(
+    {
+        "plan_id": "test-plan-001",
+        "plan_version": "1.0",
+        "steps": [
+            {
+                "step_id": "step_1",
+                "tool_name": "aws.iam_list_users",
+                "integration_id": "int-aws-001",
+                "parameters": {},
+                "description": "List all IAM users",
+                "output_alias": "all_users",
+            }
+        ],
+        "estimated_tool_calls": 1,
+        "summary": "List all IAM users from the AWS account.",
+    }
+)
+
+
+class MockLLMProvider(LLMProvider):
+    """Mock provider that returns analysis text and a valid plan."""
+
+    async def stream_completion(self, system_prompt, user_message, max_tokens):
+        yield "Analyzing your query. "
+        yield "I will list all IAM users.\n\n"
+        yield f"---PLAN_START---\n{MOCK_PLAN_JSON}\n---PLAN_END---"
+
+
+SAMPLE_CATALOG = {
+    "integrations": [
+        {
+            "integration_id": "int-aws-001",
+            "server_type": "aws",
+            "display_name": "Production AWS",
+            "tools": [
+                {
+                    "tool_name": "aws.iam_list_users",
+                    "display_name": "List IAM Users",
+                    "description": "Lists all IAM users",
+                    "category": "identity",
+                    "input_schema": {},
+                    "output_schema": {},
+                }
+            ],
+        }
+    ]
+}
 
 
 @pytest_asyncio.fixture
 async def client():
-    """Create an async HTTP client for testing."""
+    """Create an async HTTP client with a mock LLM provider."""
+    app.state.llm_provider = MockLLMProvider()
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
@@ -59,7 +114,7 @@ async def test_interpret_rejects_missing_query_id(client: AsyncClient):
     """POST /interpret returns 400 when query_id is missing."""
     response = await client.post(
         "/interpret",
-        json={"query_text": "test", "tool_catalog": {"integrations": []}},
+        json={"query_text": "test", "tool_catalog": SAMPLE_CATALOG},
     )
     assert response.status_code == 400
     error = response.json()["error"]
@@ -75,8 +130,8 @@ async def test_interpret_rejects_empty_body(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_interpret_streams_correct_ndjson_sequence(client: AsyncClient):
-    """POST /interpret streams: started → text_deltas → plan_generated."""
+async def test_interpret_rejects_empty_catalog(client: AsyncClient):
+    """POST /interpret returns 400 for empty tool catalog."""
     response = await client.post(
         "/interpret",
         json={
@@ -85,11 +140,26 @@ async def test_interpret_streams_correct_ndjson_sequence(client: AsyncClient):
             "tool_catalog": {"integrations": []},
         },
     )
+    assert response.status_code == 400
+    error = response.json()["error"]
+    assert error["code"] == "interpretation.invalid_catalog"
+
+
+@pytest.mark.asyncio
+async def test_interpret_streams_correct_ndjson_sequence(client: AsyncClient):
+    """POST /interpret streams: started → text_deltas → plan_generated."""
+    response = await client.post(
+        "/interpret",
+        json={
+            "query_id": "550e8400-e29b-41d4-a716-446655440000",
+            "query_text": "Show me all IAM users without MFA",
+            "tool_catalog": SAMPLE_CATALOG,
+        },
+    )
     assert response.status_code == 200
     assert response.headers["content-type"] == "application/x-ndjson"
 
     events = _parse_ndjson(response.text)
-    assert len(events) >= 5  # started + 3 deltas + plan_generated
 
     # First event must be interpretation_started
     assert events[0]["event"] == "interpretation_started"
@@ -97,7 +167,7 @@ async def test_interpret_streams_correct_ndjson_sequence(client: AsyncClient):
 
     # Middle events are text_delta
     delta_events = [e for e in events if e["event"] == "interpretation_text_delta"]
-    assert len(delta_events) == 3
+    assert len(delta_events) >= 1
 
     # Last event must be the terminal event
     terminal = events[-1]
@@ -105,7 +175,7 @@ async def test_interpret_streams_correct_ndjson_sequence(client: AsyncClient):
     assert "query_plan" in terminal
     assert "plan_summary" in terminal
     assert "full_interpretation_text" in terminal
-    assert len(terminal["query_plan"]["steps"]) == 2
+    assert terminal["query_plan"]["plan_id"] == "test-plan-001"
 
 
 # =============================================================================

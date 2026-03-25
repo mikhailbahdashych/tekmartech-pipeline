@@ -23,8 +23,9 @@ class Settings(BaseSettings):
     """
 
     PORT: int = 8100
-    LLM_PROVIDER: Literal["anthropic", "openai", "ollama"] = "anthropic"
+    LLM_PROVIDER: Literal["anthropic", "openai", "ollama"] = "ollama"
     ANTHROPIC_API_KEY: str | None = None
+    ANTHROPIC_MODEL: str = "claude-sonnet-4-20250514"
     OPENAI_API_KEY: str | None = None
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "llama3"
