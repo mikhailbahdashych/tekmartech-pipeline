@@ -11,8 +11,15 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
+import src.orchestrator.execute_orchestrator as _eo
 from src.llm.provider import LLMProvider
 from src.main import app
+from src.mcp.server_registry import MCPServerConfig
+from src.models.tool_invocation import (
+    ToolInvocationRequest,
+    ToolInvocationResponse,
+    ToolResponseMetadata,
+)
 
 # =============================================================================
 # Mock LLM provider for API tests
@@ -68,13 +75,57 @@ SAMPLE_CATALOG = {
 }
 
 
+class MockMCPClient:
+    """Mock MCP client that returns predefined tool responses."""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        pass
+
+    async def invoke_tool(self, request: ToolInvocationRequest) -> ToolInvocationResponse:
+        return ToolInvocationResponse(
+            invocation_id=request.invocation_id,
+            status="success",
+            data={"items": [{"id": 1, "name": "item-1"}, {"id": 2, "name": "item-2"}]},
+            metadata=ToolResponseMetadata(
+                started_at="2026-01-01T00:00:00Z",
+                completed_at="2026-01-01T00:00:01Z",
+                duration_ms=100,
+                external_api_calls=1,
+            ),
+        )
+
+
+class MockServerRegistry:
+    """Mock server registry for testing."""
+
+    def get_server_config(self, server_type: str) -> MCPServerConfig:
+        return MCPServerConfig(server_type=server_type, command="mock", args=[])
+
+    def get_all_server_types(self) -> list[str]:
+        return ["mock"]
+
+
+_original_mcp_client = _eo.MCPClient
+
+
+class _PatchedMCPClient(MockMCPClient):
+    def __init__(self, *args, **kwargs):
+        pass
+
+
 @pytest_asyncio.fixture
 async def client():
-    """Create an async HTTP client with a mock LLM provider."""
+    """Create an async HTTP client with mock LLM provider and server registry."""
     app.state.llm_provider = MockLLMProvider()
+    app.state.server_registry = MockServerRegistry()
+    _eo.MCPClient = _PatchedMCPClient
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as ac:
         yield ac
+    _eo.MCPClient = _original_mcp_client
 
 
 def _parse_ndjson(content: str) -> list[dict]:
@@ -208,7 +259,17 @@ VALID_EXECUTE_BODY = {
         "estimated_tool_calls": 2,
         "summary": "List users and get summary",
     },
-    "credentials": {},
+    "credentials": {
+        "int-001": {
+            "server_type": "aws",
+            "credential_mode": "direct",
+            "credential_data": {
+                "access_key_id": "test",
+                "secret_access_key": "test",
+                "region": "us-east-1",
+            },
+        }
+    },
 }
 
 

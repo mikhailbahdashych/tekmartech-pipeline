@@ -33,11 +33,16 @@ async def lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
 
     application.state.llm_provider = create_llm_provider(settings)
 
+    from src.mcp.server_registry import ServerRegistry
+
+    application.state.server_registry = ServerRegistry(settings.MCP_SERVERS_CONFIG)
+
     logger.info(
         "pipeline service started",
         action="startup",
         port=settings.PORT,
         llm_provider=settings.LLM_PROVIDER,
+        mcp_servers=application.state.server_registry.get_all_server_types(),
         log_level=settings.LOG_LEVEL,
     )
     yield
