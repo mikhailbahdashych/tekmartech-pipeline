@@ -8,3 +8,13 @@ servers:
     args: ["run", "python", "-m", "github.server"]
     cwd: "../tekmartech-integrations"
     server_type: "github"
+  aws:
+    command: "uv"
+    args: ["run", "python", "-m", "aws.server"]
+    cwd: "../tekmartech-integrations"
+    server_type: "aws"
+  google_workspace:
+    command: "uv"
+    args: ["run", "python", "-m", "google_workspace.server"]
+    cwd: "../tekmartech-integrations"
+    server_type: "google_workspace"
