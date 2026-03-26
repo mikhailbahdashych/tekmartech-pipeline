@@ -16,7 +16,7 @@ from src.llm.exceptions import (
     LLMTimeoutError,
     LLMUnavailableError,
 )
-from src.llm.provider import LLMProvider
+from src.llm.provider import HealthCheckResult, LLMProvider
 
 logger = structlog.get_logger(__name__)
 
@@ -44,6 +44,38 @@ class OllamaProvider(LLMProvider):
         self._base_url = base_url
         self._model = model
         self._temperature = temperature
+
+    async def health_check(self) -> HealthCheckResult:
+        """Check Ollama server connectivity by listing models.
+
+        Calls GET /api/tags which is lightweight and returns
+        the list of available models.
+
+        Returns:
+            HealthCheckResult with status and model availability.
+        """
+        try:
+            async with httpx.AsyncClient(base_url=self._base_url, timeout=5.0) as client:
+                response = await client.get("/api/tags")
+                response.raise_for_status()
+                data = response.json()
+                models = [m["name"] for m in data.get("models", [])]
+                if self._model in models or any(m.startswith(self._model) for m in models):
+                    return HealthCheckResult(
+                        status="healthy",
+                        details=f"Model '{self._model}' available",
+                    )
+                return HealthCheckResult(
+                    status="unhealthy",
+                    details=f"Model '{self._model}' not found. Available: {', '.join(models[:5])}",
+                )
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            return HealthCheckResult(
+                status="unhealthy",
+                details=f"Cannot connect to Ollama at {self._base_url}",
+            )
+        except Exception as exc:
+            return HealthCheckResult(status="unhealthy", details=str(exc))
 
     async def stream_completion(
         self,

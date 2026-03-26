@@ -7,6 +7,32 @@ is running. Conforms to the LLM Provider Abstraction described in CLAUDE.md.
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
+
+
+class HealthCheckResult:
+    """Result of an LLM provider health check.
+
+    Attributes:
+        status: "healthy" or "unhealthy".
+        checked_at: ISO 8601 timestamp of when the check was performed.
+        details: Optional message with additional context.
+    """
+
+    def __init__(self, status: str, details: str | None = None) -> None:
+        self.status = status
+        self.checked_at = datetime.now(UTC).isoformat()
+        self.details = details
+
+    def to_dict(self) -> dict:
+        """Serialize to a dict for the health endpoint response."""
+        result: dict = {
+            "status": self.status,
+            "checked_at": self.checked_at,
+        }
+        if self.details:
+            result["details"] = self.details
+        return result
 
 
 class LLMProvider(ABC):
@@ -16,6 +42,18 @@ class LLMProvider(ABC):
     the stream_completion method. The Interpreter calls it without
     knowing which provider is active.
     """
+
+    @abstractmethod
+    async def health_check(self) -> HealthCheckResult:
+        """Check whether the provider is reachable and operational.
+
+        Each provider implements a lightweight, non-billable probe
+        (e.g., listing models) to verify connectivity and auth.
+
+        Returns:
+            HealthCheckResult with status and timestamp.
+        """
+        ...
 
     @abstractmethod
     async def stream_completion(

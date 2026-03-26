@@ -12,7 +12,7 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
 import src.orchestrator.execute_orchestrator as _eo
-from src.llm.provider import LLMProvider
+from src.llm.provider import HealthCheckResult, LLMProvider
 from src.main import app
 from src.mcp.server_registry import MCPServerConfig
 from src.models.tool_invocation import (
@@ -47,6 +47,9 @@ MOCK_PLAN_JSON = json.dumps(
 
 class MockLLMProvider(LLMProvider):
     """Mock provider that returns analysis text and a valid plan."""
+
+    async def health_check(self):
+        return HealthCheckResult(status="healthy", details="mock provider")
 
     async def stream_completion(self, system_prompt, user_message, max_tokens):
         yield "Analyzing your query. "
@@ -151,7 +154,8 @@ async def test_health_returns_correct_structure(client: AsyncClient):
     assert isinstance(data["uptime_seconds"], int)
     assert data["uptime_seconds"] >= 0
     assert "llm_provider" in data["components"]
-    assert data["components"]["llm_provider"]["status"] == "unknown"
+    assert data["components"]["llm_provider"]["status"] == "healthy"
+    assert data["components"]["llm_provider"]["checked_at"] is not None
     assert isinstance(data["components"]["mcp_servers"], list)
 
 

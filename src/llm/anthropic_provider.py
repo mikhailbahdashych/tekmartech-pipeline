@@ -16,7 +16,7 @@ from src.llm.exceptions import (
     LLMTimeoutError,
     LLMUnavailableError,
 )
-from src.llm.provider import LLMProvider
+from src.llm.provider import HealthCheckResult, LLMProvider
 
 logger = structlog.get_logger(__name__)
 
@@ -44,6 +44,34 @@ class AnthropicProvider(LLMProvider):
         self._client = anthropic.AsyncAnthropic(api_key=api_key)
         self._model = model
         self._temperature = temperature
+
+    async def health_check(self) -> HealthCheckResult:
+        """Check Anthropic API connectivity by listing models.
+
+        Uses the models list endpoint which verifies both
+        connectivity and API key validity without token usage.
+
+        Returns:
+            HealthCheckResult with status and details.
+        """
+        try:
+            await self._client.models.list(limit=1)
+            return HealthCheckResult(
+                status="healthy",
+                details=f"Anthropic API reachable, model '{self._model}'",
+            )
+        except anthropic.AuthenticationError:
+            return HealthCheckResult(
+                status="unhealthy",
+                details="Invalid or missing API key",
+            )
+        except (anthropic.APIConnectionError, anthropic.APITimeoutError):
+            return HealthCheckResult(
+                status="unhealthy",
+                details="Cannot connect to Anthropic API",
+            )
+        except Exception as exc:
+            return HealthCheckResult(status="unhealthy", details=str(exc))
 
     async def stream_completion(
         self,

@@ -6,7 +6,7 @@ import pytest
 
 from src.config import get_settings
 from src.llm.exceptions import LLMTimeoutError, LLMUnavailableError
-from src.llm.provider import LLMProvider
+from src.llm.provider import HealthCheckResult, LLMProvider
 from src.models.tool_catalog import CatalogIntegration, ToolCatalog, ToolDefinition
 from src.orchestrator.interpret_orchestrator import interpret_stream
 
@@ -56,6 +56,9 @@ class MockLLMProvider(LLMProvider):
     def __init__(self, chunks: list[str]) -> None:
         self._chunks = chunks
 
+    async def health_check(self):
+        return HealthCheckResult(status="healthy", details="mock")
+
     async def stream_completion(self, system_prompt, user_message, max_tokens):
         for chunk in self._chunks:
             yield chunk
@@ -66,6 +69,9 @@ class ErrorLLMProvider(LLMProvider):
 
     def __init__(self, error: Exception) -> None:
         self._error = error
+
+    async def health_check(self):
+        return HealthCheckResult(status="healthy", details="mock")
 
     async def stream_completion(self, system_prompt, user_message, max_tokens):
         raise self._error
