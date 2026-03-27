@@ -25,12 +25,8 @@ uv.lock
 
 # Environment variables
 .env
-.env.*
-
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
+.env.development
+.env.production
 
 # OS
 .DS_Store

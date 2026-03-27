@@ -1,9 +1,12 @@
 """Application configuration and structured logging setup.
 
-Loads all environment variables via Pydantic Settings and configures
-structlog for JSON output (production) or human-readable output (development).
+Loads environment variables from .env.development or .env.production
+based on the PIPELINE_ENV variable (defaults to "development").
+Configures structlog for JSON output (production) or human-readable
+output (development).
 """
 
+import os
 from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Literal
@@ -14,6 +17,19 @@ from pydantic_settings import BaseSettings
 SERVICE_START_TIME: datetime = datetime.now(UTC)
 
 
+def _resolve_env_file() -> str:
+    """Determine which .env file to load.
+
+    Reads PIPELINE_ENV from the OS environment. Accepted values are
+    "development" and "production". Defaults to "development".
+
+    Returns:
+        Path to the environment file.
+    """
+    env = os.environ.get("PIPELINE_ENV", "development").lower()
+    return f".env.{env}"
+
+
 class Settings(BaseSettings):
     """Pipeline Service configuration loaded from environment variables.
 
@@ -22,6 +38,7 @@ class Settings(BaseSettings):
     LLM_PROVIDER is selected.
     """
 
+    PIPELINE_ENV: str = "development"
     PORT: int = 8100
     LLM_PROVIDER: Literal["anthropic", "openai", "ollama"] = "ollama"
     ANTHROPIC_API_KEY: str | None = None
@@ -36,7 +53,7 @@ class Settings(BaseSettings):
     STEP_TIMEOUT_SECONDS: int = 30
     LOG_LEVEL: str = "INFO"
 
-    model_config = {"env_file": ".env", "extra": "ignore"}
+    model_config = {"env_file": _resolve_env_file(), "extra": "ignore"}
 
 
 @lru_cache
