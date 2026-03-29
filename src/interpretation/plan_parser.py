@@ -1,12 +1,14 @@
 """Plan parser for extracting query plans from LLM output.
 
 Extracts the natural language analysis and structured query plan from
-the complete LLM response text. Validates the plan against the Pydantic
-model and the tool catalog (Architectural Invariant #5).
+the complete LLM response text. The LLM produces only intelligence fields
+(tool_name, integration_id, parameters, description, output_alias, summary).
+The parser injects all mechanical fields (plan_id, plan_version, step_id,
+estimated_tool_calls) and validates against the Pydantic model and the
+tool catalog (Architectural Invariant #5).
 """
 
 import json
-import re
 import uuid
 from dataclasses import dataclass
 
@@ -36,7 +38,7 @@ class ParseResult:
     error_message: str | None
 
 
-def _extract_with_delimiters(full_text: str) -> tuple[str, str | None]:
+def _extract_plan_json(full_text: str) -> tuple[str, str | None]:
     """Extract plan JSON using ---PLAN_START--- / ---PLAN_END--- delimiters.
 
     Args:
@@ -47,7 +49,7 @@ def _extract_with_delimiters(full_text: str) -> tuple[str, str | None]:
     """
     start_idx = full_text.find(PLAN_START_DELIMITER)
     if start_idx == -1:
-        return full_text, None
+        return full_text.strip(), None
 
     analysis_text = full_text[:start_idx].strip()
     after_start = full_text[start_idx + len(PLAN_START_DELIMITER) :]
@@ -58,133 +60,123 @@ def _extract_with_delimiters(full_text: str) -> tuple[str, str | None]:
     return analysis_text, plan_json
 
 
-def _extract_with_code_fence(full_text: str) -> tuple[str, str | None]:
-    """Extract plan JSON from the last ```json code fence.
+def _validate_llm_fields(plan_dict: dict) -> str | None:
+    """Validate that all LLM-produced fields are present and correct.
+
+    Checks the raw dict before constructing any Pydantic model.
 
     Args:
-        full_text: The complete LLM output.
+        plan_dict: The parsed JSON dict from the LLM.
 
     Returns:
-        Tuple of (analysis_text, plan_json_string or None).
+        Error message string if validation fails, None if all fields are valid.
     """
-    pattern = r"```(?:json)?\s*\n(.*?)```"
-    matches = list(re.finditer(pattern, full_text, re.DOTALL))
-    if not matches:
-        return full_text, None
+    # Top-level fields
+    steps = plan_dict.get("steps")
+    if not isinstance(steps, list) or len(steps) == 0:
+        return "Plan has no steps."
 
-    last_match = matches[-1]
-    analysis_text = full_text[: last_match.start()].strip()
-    plan_json = last_match.group(1).strip()
+    summary = plan_dict.get("summary")
+    if not isinstance(summary, str) or not summary.strip():
+        return "Plan has no summary."
 
-    return analysis_text, plan_json
-
-
-def _extract_last_json_object(full_text: str) -> tuple[str, str | None]:
-    """Extract the last JSON object from the text by finding matching braces.
-
-    Args:
-        full_text: The complete LLM output.
-
-    Returns:
-        Tuple of (analysis_text, plan_json_string or None).
-    """
-    last_close = full_text.rfind("}")
-    if last_close == -1:
-        return full_text, None
-
-    depth = 0
-    for i in range(last_close, -1, -1):
-        if full_text[i] == "}":
-            depth += 1
-        elif full_text[i] == "{":
-            depth -= 1
-        if depth == 0:
-            analysis_text = full_text[:i].strip()
-            plan_json = full_text[i : last_close + 1]
-            return analysis_text, plan_json
-
-    return full_text, None
-
-
-def _remap_template_references(value: object, id_map: dict[str, str]) -> object:
-    """Recursively remap {{old_step_id.path}} references in parameter values.
-
-    Args:
-        value: A parameter value (str, dict, list, or scalar).
-        id_map: Mapping from old step_id to new step_id.
-
-    Returns:
-        The value with all step_id references remapped.
-    """
-    if isinstance(value, str):
-        for old_id, new_id in id_map.items():
-            value = value.replace(f"{{{{{old_id}.", f"{{{{{new_id}.")
-        return value
-    if isinstance(value, dict):
-        return {k: _remap_template_references(v, id_map) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_remap_template_references(item, id_map) for item in value]
-    return value
-
-
-def _normalize_system_fields(plan_data: dict) -> dict:
-    """Override all fields that must be deterministic / system-controlled.
-
-    Assigns:
-    - plan_id: fresh UUID
-    - plan_version: always "1.0"
-    - step_id: sequential "step_1", "step_2", ...
-    - estimated_tool_calls: len(steps)
-
-    Also remaps cross-references (depends_on, iterate_over.source_step,
-    and {{step_id.path}} templates in parameters) to use the new step_ids.
-
-    Args:
-        plan_data: The raw plan dict parsed from the LLM JSON.
-
-    Returns:
-        The plan dict with all system fields normalized.
-    """
-    plan_data["plan_id"] = str(uuid.uuid4())
-    plan_data["plan_version"] = "1.0"
-
-    steps = plan_data.get("steps", [])
-    plan_data["estimated_tool_calls"] = len(steps)
-
-    # Build mapping from old step_ids to new sequential step_ids
-    id_map: dict[str, str] = {}
+    # Per-step fields
     for i, step in enumerate(steps):
-        old_id = step.get("step_id", f"step_{i + 1}")
-        new_id = f"step_{i + 1}"
-        id_map[old_id] = new_id
+        step_label = f"Step {i + 1}"
 
-    # Apply new step_ids and remap cross-references
+        tool_name = step.get("tool_name")
+        if not isinstance(tool_name, str) or not tool_name.strip():
+            return f"{step_label} has no tool_name."
+
+        integration_id = step.get("integration_id")
+        if not isinstance(integration_id, str) or not integration_id.strip():
+            return f"{step_label} has no integration_id."
+
+        # parameters: default to {} if missing
+        if "parameters" not in step or step["parameters"] is None:
+            step["parameters"] = {}
+        if not isinstance(step["parameters"], dict):
+            return f"{step_label} has invalid parameters (must be an object)."
+
+        description = step.get("description")
+        if not isinstance(description, str) or not description.strip():
+            return f"{step_label} has no description."
+
+        output_alias = step.get("output_alias")
+        if not isinstance(output_alias, str) or not output_alias.strip():
+            return f"{step_label} has no output_alias."
+
+    return None
+
+
+def _inject_mechanical_fields(plan_dict: dict) -> str | None:
+    """Inject system-controlled fields into the validated plan dict.
+
+    Sets plan_id, plan_version, step_ids, and estimated_tool_calls.
+    Validates cross-references (depends_on, iterate_over.source_step).
+
+    Args:
+        plan_dict: The validated plan dict (mutated in place).
+
+    Returns:
+        Error message string if cross-reference validation fails, None on success.
+    """
+    plan_dict["plan_id"] = str(uuid.uuid4())
+    plan_dict["plan_version"] = "1.0"
+
+    steps = plan_dict["steps"]
+
+    # Assign step_ids
     for i, step in enumerate(steps):
         step["step_id"] = f"step_{i + 1}"
 
-        # Remap depends_on
-        if "depends_on" in step and step["depends_on"]:
-            step["depends_on"] = [id_map.get(dep, dep) for dep in step["depends_on"]]
+    # Calculate estimated_tool_calls
+    estimated = 0
+    for step in steps:
+        if step.get("iterate_over"):
+            estimated += 10
+        else:
+            estimated += 1
+        if step.get("paginate", True) is not False:
+            estimated += 1
+    plan_dict["estimated_tool_calls"] = estimated
 
-        # Remap iterate_over.source_step
-        if "iterate_over" in step and step["iterate_over"]:
-            old_source = step["iterate_over"].get("source_step", "")
-            step["iterate_over"]["source_step"] = id_map.get(old_source, old_source)
+    # Validate cross-references
+    valid_step_ids = {step["step_id"] for step in steps}
+    step_id_indices = {step["step_id"]: i for i, step in enumerate(steps)}
 
-        # Remap {{step_id.path}} references in parameters
-        if "parameters" in step:
-            step["parameters"] = _remap_template_references(step["parameters"], id_map)
+    for step in steps:
+        step_id = step["step_id"]
+        step_idx = step_id_indices[step_id]
 
-    return plan_data
+        # Validate depends_on
+        if step.get("depends_on"):
+            for dep_id in step["depends_on"]:
+                if dep_id not in valid_step_ids:
+                    return f"Step {step_id} references non-existent step {dep_id}."
+                if step_id_indices[dep_id] >= step_idx:
+                    return f"Step {step_id} references non-existent step {dep_id}."
+
+        # Validate iterate_over.source_step
+        if step.get("iterate_over"):
+            source = step["iterate_over"].get("source_step", "")
+            if source not in valid_step_ids:
+                return f"Step {step_id} references non-existent step {source}."
+            if step_id_indices[source] >= step_idx:
+                return f"Step {step_id} references non-existent step {source}."
+
+    return None
 
 
 def parse_plan_from_llm_output(full_text: str) -> ParseResult:
     """Parse the LLM output to extract analysis text and query plan.
 
-    Tries multiple extraction strategies in order of priority:
-    1. Custom delimiters (---PLAN_START--- / ---PLAN_END---)
-    2. Markdown JSON code fences
-    3. Last bare JSON object
+    Strict 5-step process:
+    1. Extract JSON between ---PLAN_START--- and ---PLAN_END---.
+    2. Validate LLM-produced fields (tool_name, integration_id, etc.).
+    3. Inject mechanical fields (plan_id, plan_version, step_id, etc.).
+    4. Construct the Pydantic QueryPlan model.
+    5. (Catalog validation is done separately via validate_plan_against_catalog.)
 
     Args:
         full_text: The complete accumulated LLM output text.
@@ -198,60 +190,69 @@ def parse_plan_from_llm_output(full_text: str) -> ParseResult:
         text_length=len(full_text),
     )
 
-    # Strategy 1: Custom delimiters
-    analysis_text, plan_json = _extract_with_delimiters(full_text)
-    extraction_method = "delimiters"
+    # Step 1: Extract JSON
+    analysis_text, plan_json = _extract_plan_json(full_text)
 
-    # Strategy 2: Code fence fallback
-    if plan_json is None:
-        analysis_text, plan_json = _extract_with_code_fence(full_text)
-        extraction_method = "code_fence"
-
-    # Strategy 3: Last JSON object fallback
-    if plan_json is None:
-        analysis_text, plan_json = _extract_last_json_object(full_text)
-        extraction_method = "bare_json"
-
-    # No plan found
     if plan_json is None:
         logger.info(
             "no plan block found in LLM output",
             action="parse_plan",
         )
         return ParseResult(
-            analysis_text=full_text.strip(),
+            analysis_text=analysis_text,
             query_plan=None,
-            error_message="No plan block found in LLM output. "
-            "The AI may have determined the query cannot be answered.",
+            error_message="No plan block found in LLM output.",
         )
 
-    # Parse JSON
     try:
-        plan_data = json.loads(plan_json)
+        plan_dict = json.loads(plan_json)
     except json.JSONDecodeError as exc:
         logger.warn(
             "invalid JSON in plan block",
             action="parse_plan",
-            extraction_method=extraction_method,
             error=str(exc),
         )
         return ParseResult(
             analysis_text=analysis_text,
             query_plan=None,
-            error_message=f"Plan block contains invalid JSON: {exc}",
+            error_message=f"Invalid JSON in plan block: {exc}",
         )
 
-    # Override system-controlled fields (LLMs produce unreliable IDs)
-    plan_data = _normalize_system_fields(plan_data)
+    # Step 2: Validate LLM-produced fields
+    validation_error = _validate_llm_fields(plan_dict)
+    if validation_error:
+        logger.warn(
+            "LLM field validation failed",
+            action="parse_plan",
+            error=validation_error,
+        )
+        return ParseResult(
+            analysis_text=analysis_text,
+            query_plan=None,
+            error_message=validation_error,
+        )
 
-    # Validate against Pydantic model
+    # Step 3: Inject mechanical fields
+    injection_error = _inject_mechanical_fields(plan_dict)
+    if injection_error:
+        logger.warn(
+            "cross-reference validation failed",
+            action="parse_plan",
+            error=injection_error,
+        )
+        return ParseResult(
+            analysis_text=analysis_text,
+            query_plan=None,
+            error_message=injection_error,
+        )
+
+    # Step 4: Construct the Pydantic model
     try:
-        query_plan = QueryPlan(**plan_data)
+        query_plan = QueryPlan.model_validate(plan_dict)
     except Exception as exc:
         logger.warn(
             "plan JSON does not match QueryPlan schema",
             action="parse_plan",
-            extraction_method=extraction_method,
             error=str(exc),
         )
         return ParseResult(
@@ -263,7 +264,6 @@ def parse_plan_from_llm_output(full_text: str) -> ParseResult:
     logger.info(
         "plan parsed successfully",
         action="parse_plan",
-        extraction_method=extraction_method,
         step_count=len(query_plan.steps),
     )
 

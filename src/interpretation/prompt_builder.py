@@ -2,7 +2,9 @@
 
 Translates a tool_catalog into an LLM prompt that instructs the AI
 to analyze an infrastructure query and produce a structured query plan.
-The prompt quality directly determines plan quality.
+The prompt tells the LLM to produce ONLY the intelligence fields (tool
+selection, parameters, reasoning). Mechanical fields (plan_id, plan_version,
+step_id, estimated_tool_calls) are injected by the parser after the fact.
 """
 
 import json
@@ -14,98 +16,64 @@ from src.models.tool_catalog import ToolCatalog
 logger = structlog.get_logger(__name__)
 
 ROLE_SECTION = """\
-You are an infrastructure query planner for Tekmar, an AI-powered security \
-and compliance analysis tool. Your task is to analyze a user's natural \
-language question about their infrastructure and produce a structured \
-execution plan that will answer it.
-
-You have access to a set of MCP tools organized by integration. Each \
-integration represents a connected external system (e.g., an AWS account, \
-a GitHub organization). You MUST only use tools from the catalog provided \
-below.\
+You are an infrastructure query planner. You analyze questions about IT \
+infrastructure and produce execution plans using the available tools listed \
+below. You MUST only reference tools and integration IDs from the catalog \
+provided.\
 """
 
 OUTPUT_FORMAT_SECTION = """\
-## Your Response Format
+## Response Format
 
-Structure your response in two parts:
+Respond in two parts.
 
-**Part 1 — Analysis (natural language)**
-Write a clear analysis explaining:
-- What the user is asking for
-- Which tools and integrations you will use and why
-- How the steps connect (what data flows from one step to the next)
-- Any assumptions you are making
+PART 1: Write a brief analysis (2-4 sentences) explaining what the user \
+is asking and which tools you will use.
 
-**Part 2 — Execution Plan (structured JSON)**
-After your analysis, output the structured plan between these exact delimiters:
+PART 2: Output a JSON execution plan between these exact markers:
 
 ---PLAN_START---
-{
-  "plan_id": "auto",
-  "plan_version": "auto",
-  "steps": [
-    {
-      "step_id": "step_1",
-      "tool_name": "<tool_name from catalog>",
-      "integration_id": "<integration_id that owns this tool>",
-      "parameters": {},
-      "description": "<what this step does and why>",
-      "output_alias": "<snake_case name for this step's output>"
-    }
-  ],
-  "estimated_tool_calls": 0,
-  "summary": "<human-readable summary of the entire plan>"
-}
+<your JSON here>
 ---PLAN_END---
 
-### System-assigned fields (do NOT change these values):
-- **plan_id**: Always set to "auto"
-- **plan_version**: Always set to "auto"
-- **step_id**: Always use "step_1", "step_2", "step_3", etc. in order
-- **estimated_tool_calls**: Always set to 0
+The JSON must have this exact structure:
+{
+  "steps": [ ... ],
+  "summary": "..."
+}
 
-These fields are overwritten by the system after parsing. Focus on the \
-fields that matter: tool_name, integration_id, parameters, and the plan logic.
+Each step in the "steps" array must have exactly these fields:
+- "tool_name": exact tool name from the catalog (e.g., "github.list_repositories")
+- "integration_id": exact integration ID from the catalog (the UUID shown in the catalog)
+- "parameters": object matching the tool's input parameters (use {} if none required)
+- "description": one sentence explaining what this step does
+- "output_alias": short snake_case label for this step's output (e.g., "org_repos")
 
-### Plan field requirements:
-- **tool_name**: Must exactly match a tool_name from the catalog below
-- **integration_id**: Must exactly match the integration_id that owns the tool
-- **parameters**: Must conform to the tool's input_schema
-- **description**: Clear explanation of what this step does
-- **output_alias**: Descriptive snake_case name (e.g., "all_iam_users")
-- **summary**: Clear explanation a non-technical person can understand
+Optional step fields (include only when needed):
+- "depends_on": array of step numbers from earlier steps, e.g., ["step_1"]
+- "transform": { "filter": { "array_path": "...", "condition": { "field": "...", \
+"operator": "equals", "value": ... } }, "select_fields": ["field1", "field2"] }
+- "iterate_over": { "source_step": "step_1", "array_path": "items", \
+"item_alias": "item" }
+- "paginate": false (only if you want just the first page; default is true)
 
-### Optional step fields:
-- **depends_on**: Array of step_ids that must complete first
-- **transform**: Filter or select fields from results
-  - filter: { "array_path": "users", "condition": { "field": "mfa_enabled", \
-"operator": "equals", "value": false } }
-  - select_fields: ["username", "mfa_enabled"]
-- **iterate_over**: Execute per item from a previous step
-  - { "source_step": "step_1", "array_path": "repositories", "item_alias": "repo" }
-- **paginate**: Boolean, default true. Set false to only get the first page.
+The "summary" field is a one-sentence explanation of the entire plan for a \
+non-technical person.
 
-### Referencing previous step output:
-Use template syntax: "{{step_1.all_iam_users.users}}" to reference the \
-"users" field from step_1's output.\
+Do NOT include plan_id, plan_version, step_id, or estimated_tool_calls. \
+These are added automatically by the system.\
 """
 
 CONSTRAINTS_SECTION = """\
-## Constraints
-
-1. You MUST only use tool_name values that appear in the catalog above.
-2. You MUST only use integration_id values that appear in the catalog above.
-3. Each tool MUST be paired with the integration_id of the integration that owns it.
-4. If the user's question cannot be answered with the available tools, explain \
-why in your analysis and do NOT output a ---PLAN_START--- block.
-5. Keep plans as simple as possible — use the minimum number of steps needed.
-6. Do NOT copy integration_id values from examples. The only valid \
-integration_id values are those listed in the Available Tool Catalog section. \
-Each integration_id is a UUID like '4f405c15-a2a8-4c62-8363-b462b5bb7abe', \
-not a short string like 'int-aws-001'.
-7. Do NOT modify system-assigned fields (plan_id, plan_version, \
-estimated_tool_calls). Leave them exactly as shown in the template.\
+## Rules
+1. Only use tool_name values from the catalog above.
+2. Only use integration_id values from the catalog above. They are UUIDs.
+3. Each tool must be paired with the integration_id that owns it.
+4. If the question cannot be answered with the available tools, explain why \
+and do NOT output ---PLAN_START---.
+5. Use the fewest steps possible.
+6. Do NOT include plan_id, plan_version, step_id, or estimated_tool_calls \
+in your JSON.\
 """
 
 
@@ -123,7 +91,6 @@ def _build_dynamic_example(tool_catalog: ToolCatalog) -> str:
     Returns:
         Formatted example section string.
     """
-    # Find first integration with tools
     integration = None
     for integ in tool_catalog.integrations:
         if integ.tools:
@@ -134,34 +101,24 @@ def _build_dynamic_example(tool_catalog: ToolCatalog) -> str:
         return ""
 
     tool = integration.tools[0]
+    tool_action = tool.tool_name.split(".")[-1].replace("_", " ")
 
-    return f"""\
-## Example
-
-The example below uses real integration and tool values from YOUR catalog \
-above. Always use the exact integration_id and tool_name values from the catalog.
-
-For this catalog, a simple single-step plan would look like:
+    return f"""## Example using your catalog
 
 ---PLAN_START---
 {{
-  "plan_id": "auto",
-  "plan_version": "auto",
   "steps": [
     {{
-      "step_id": "step_1",
       "tool_name": "{tool.tool_name}",
       "integration_id": "{integration.integration_id}",
       "parameters": {{}},
-      "description": "Retrieve data using {tool.display_name} from {integration.display_name}",
-      "output_alias": "{tool.tool_name.split(".")[-1]}_results"
+      "description": "{tool_action.capitalize()} from {integration.display_name}",
+      "output_alias": "{tool.tool_name.split('.')[-1]}_data"
     }}
   ],
-  "estimated_tool_calls": 0,
-  "summary": "Query {integration.display_name} using {tool.display_name}."
+  "summary": "Use {tool.display_name} to {tool_action} from {integration.display_name}."
 }}
----PLAN_END---\
-"""
+---PLAN_END---"""
 
 
 def _format_tool_catalog(tool_catalog: ToolCatalog) -> str:
