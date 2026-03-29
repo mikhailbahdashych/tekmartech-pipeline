@@ -42,8 +42,8 @@ After your analysis, output the structured plan between these exact delimiters:
 
 ---PLAN_START---
 {
-  "plan_id": "<generate a unique UUID>",
-  "plan_version": "1.0",
+  "plan_id": "auto",
+  "plan_version": "auto",
   "steps": [
     {
       "step_id": "step_1",
@@ -54,22 +54,26 @@ After your analysis, output the structured plan between these exact delimiters:
       "output_alias": "<snake_case name for this step's output>"
     }
   ],
-  "estimated_tool_calls": <integer>,
+  "estimated_tool_calls": 0,
   "summary": "<human-readable summary of the entire plan>"
 }
 ---PLAN_END---
 
+### System-assigned fields (do NOT change these values):
+- **plan_id**: Always set to "auto"
+- **plan_version**: Always set to "auto"
+- **step_id**: Always use "step_1", "step_2", "step_3", etc. in order
+- **estimated_tool_calls**: Always set to 0
+
+These fields are overwritten by the system after parsing. Focus on the \
+fields that matter: tool_name, integration_id, parameters, and the plan logic.
+
 ### Plan field requirements:
-- **plan_id**: A UUID you generate (e.g., "a1b2c3d4-e5f6-7890-abcd-ef1234567890")
-- **plan_version**: Always "1.0"
-- **steps**: Ordered array, at least one step. Steps execute sequentially.
-- **step_id**: Convention "step_1", "step_2", etc.
 - **tool_name**: Must exactly match a tool_name from the catalog below
 - **integration_id**: Must exactly match the integration_id that owns the tool
 - **parameters**: Must conform to the tool's input_schema
 - **description**: Clear explanation of what this step does
 - **output_alias**: Descriptive snake_case name (e.g., "all_iam_users")
-- **estimated_tool_calls**: Total expected MCP invocations including pagination
 - **summary**: Clear explanation a non-technical person can understand
 
 ### Optional step fields:
@@ -95,45 +99,67 @@ CONSTRAINTS_SECTION = """\
 3. Each tool MUST be paired with the integration_id of the integration that owns it.
 4. If the user's question cannot be answered with the available tools, explain \
 why in your analysis and do NOT output a ---PLAN_START--- block.
-5. estimated_tool_calls should account for pagination and iteration expansions.
-6. Keep plans as simple as possible — use the minimum number of steps needed.\
+5. Keep plans as simple as possible — use the minimum number of steps needed.
+6. Do NOT copy integration_id values from examples. The only valid \
+integration_id values are those listed in the Available Tool Catalog section. \
+Each integration_id is a UUID like '4f405c15-a2a8-4c62-8363-b462b5bb7abe', \
+not a short string like 'int-aws-001'.
+7. Do NOT modify system-assigned fields (plan_id, plan_version, \
+estimated_tool_calls). Leave them exactly as shown in the template.\
 """
 
-EXAMPLE_SECTION = """\
+
+def _build_dynamic_example(tool_catalog: ToolCatalog) -> str:
+    """Build an example plan section using real catalog values.
+
+    Uses the first integration with at least one tool to construct
+    an example, so the LLM sees consistent IDs between the catalog
+    and the example. This prevents smaller models from copying
+    hardcoded fake IDs.
+
+    Args:
+        tool_catalog: The filtered tool catalog for this query.
+
+    Returns:
+        Formatted example section string.
+    """
+    # Find first integration with tools
+    integration = None
+    for integ in tool_catalog.integrations:
+        if integ.tools:
+            integration = integ
+            break
+
+    if integration is None:
+        return ""
+
+    tool = integration.tools[0]
+
+    return f"""\
 ## Example
 
-For a query "Show me all IAM users without MFA" with an AWS integration \
-(id: "int-aws-001") that has tools aws.iam_list_users and \
-aws.iam_get_account_summary, a good plan would be:
+The example below uses real integration and tool values from YOUR catalog \
+above. Always use the exact integration_id and tool_name values from the catalog.
+
+For this catalog, a simple single-step plan would look like:
 
 ---PLAN_START---
-{
-  "plan_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
-  "plan_version": "1.0",
+{{
+  "plan_id": "auto",
+  "plan_version": "auto",
   "steps": [
-    {
+    {{
       "step_id": "step_1",
-      "tool_name": "aws.iam_list_users",
-      "integration_id": "int-aws-001",
-      "parameters": {"max_results": 1000},
-      "description": "Retrieve all IAM users with their MFA status and metadata",
-      "output_alias": "all_iam_users",
-      "transform": {
-        "filter": {
-          "array_path": "users",
-          "condition": {
-            "field": "mfa_enabled",
-            "operator": "equals",
-            "value": false
-          }
-        },
-        "select_fields": ["username", "user_id", "mfa_enabled", "last_login_at", "created_at"]
-      }
-    }
+      "tool_name": "{tool.tool_name}",
+      "integration_id": "{integration.integration_id}",
+      "parameters": {{}},
+      "description": "Retrieve data using {tool.display_name} from {integration.display_name}",
+      "output_alias": "{tool.tool_name.split(".")[-1]}_results"
+    }}
   ],
-  "estimated_tool_calls": 1,
-  "summary": "List all IAM users and filter for those without MFA enabled."
-}
+  "estimated_tool_calls": 0,
+  "summary": "Query {integration.display_name} using {tool.display_name}."
+}}
 ---PLAN_END---\
 """
 
@@ -218,13 +244,14 @@ def build_interpretation_prompt(
         )
 
     catalog_section = _format_tool_catalog(tool_catalog)
+    example_section = _build_dynamic_example(tool_catalog)
 
     system_prompt = "\n\n".join(
         [
             ROLE_SECTION,
             catalog_section,
             OUTPUT_FORMAT_SECTION,
-            EXAMPLE_SECTION,
+            example_section,
             CONSTRAINTS_SECTION,
         ]
     )

@@ -7,6 +7,7 @@ model and the tool catalog (Architectural Invariant #5).
 
 import json
 import re
+import uuid
 from dataclasses import dataclass
 
 import structlog
@@ -105,6 +106,78 @@ def _extract_last_json_object(full_text: str) -> tuple[str, str | None]:
     return full_text, None
 
 
+def _remap_template_references(value: object, id_map: dict[str, str]) -> object:
+    """Recursively remap {{old_step_id.path}} references in parameter values.
+
+    Args:
+        value: A parameter value (str, dict, list, or scalar).
+        id_map: Mapping from old step_id to new step_id.
+
+    Returns:
+        The value with all step_id references remapped.
+    """
+    if isinstance(value, str):
+        for old_id, new_id in id_map.items():
+            value = value.replace(f"{{{{{old_id}.", f"{{{{{new_id}.")
+        return value
+    if isinstance(value, dict):
+        return {k: _remap_template_references(v, id_map) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_remap_template_references(item, id_map) for item in value]
+    return value
+
+
+def _normalize_system_fields(plan_data: dict) -> dict:
+    """Override all fields that must be deterministic / system-controlled.
+
+    Assigns:
+    - plan_id: fresh UUID
+    - plan_version: always "1.0"
+    - step_id: sequential "step_1", "step_2", ...
+    - estimated_tool_calls: len(steps)
+
+    Also remaps cross-references (depends_on, iterate_over.source_step,
+    and {{step_id.path}} templates in parameters) to use the new step_ids.
+
+    Args:
+        plan_data: The raw plan dict parsed from the LLM JSON.
+
+    Returns:
+        The plan dict with all system fields normalized.
+    """
+    plan_data["plan_id"] = str(uuid.uuid4())
+    plan_data["plan_version"] = "1.0"
+
+    steps = plan_data.get("steps", [])
+    plan_data["estimated_tool_calls"] = len(steps)
+
+    # Build mapping from old step_ids to new sequential step_ids
+    id_map: dict[str, str] = {}
+    for i, step in enumerate(steps):
+        old_id = step.get("step_id", f"step_{i + 1}")
+        new_id = f"step_{i + 1}"
+        id_map[old_id] = new_id
+
+    # Apply new step_ids and remap cross-references
+    for i, step in enumerate(steps):
+        step["step_id"] = f"step_{i + 1}"
+
+        # Remap depends_on
+        if "depends_on" in step and step["depends_on"]:
+            step["depends_on"] = [id_map.get(dep, dep) for dep in step["depends_on"]]
+
+        # Remap iterate_over.source_step
+        if "iterate_over" in step and step["iterate_over"]:
+            old_source = step["iterate_over"].get("source_step", "")
+            step["iterate_over"]["source_step"] = id_map.get(old_source, old_source)
+
+        # Remap {{step_id.path}} references in parameters
+        if "parameters" in step:
+            step["parameters"] = _remap_template_references(step["parameters"], id_map)
+
+    return plan_data
+
+
 def parse_plan_from_llm_output(full_text: str) -> ParseResult:
     """Parse the LLM output to extract analysis text and query plan.
 
@@ -167,6 +240,9 @@ def parse_plan_from_llm_output(full_text: str) -> ParseResult:
             query_plan=None,
             error_message=f"Plan block contains invalid JSON: {exc}",
         )
+
+    # Override system-controlled fields (LLMs produce unreliable IDs)
+    plan_data = _normalize_system_fields(plan_data)
 
     # Validate against Pydantic model
     try:

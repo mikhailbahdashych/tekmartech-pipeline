@@ -40,6 +40,7 @@ async def lifespan(application: FastAPI) -> AsyncGenerator[None, None]:
     logger.info(
         "pipeline service started",
         action="startup",
+        environment=settings.PIPELINE_ENV,
         port=settings.PORT,
         llm_provider=settings.LLM_PROVIDER,
         mcp_servers=application.state.server_registry.get_all_server_types(),
