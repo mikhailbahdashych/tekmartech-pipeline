@@ -1,0 +1,20 @@
+# MCP Server Configuration
+# Maps server_type to the command needed to launch each MCP server process.
+# The Pipeline Service reads this file on startup to discover available servers.
+
+servers:
+  github:
+    command: "uv"
+    args: ["run", "python", "-m", "github.server"]
+    cwd: "../tekmartech-integrations"
+    server_type: "github"
+  aws:
+    command: "uv"
+    args: ["run", "python", "-m", "aws.server"]
+    cwd: "../tekmartech-integrations"
+    server_type: "aws"
+  google_workspace:
+    command: "uv"
+    args: ["run", "python", "-m", "google_workspace.server"]
+    cwd: "../tekmartech-integrations"
+    server_type: "google_workspace"
