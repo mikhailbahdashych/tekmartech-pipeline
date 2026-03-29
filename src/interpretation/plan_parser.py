@@ -246,6 +246,15 @@ def parse_plan_from_llm_output(full_text: str) -> ParseResult:
             error_message=injection_error,
         )
 
+    logger.info(
+        "mechanical fields injected",
+        action="parse_plan",
+        plan_id=plan_dict["plan_id"],
+        plan_version=plan_dict["plan_version"],
+        step_ids=[s["step_id"] for s in plan_dict["steps"]],
+        estimated_tool_calls=plan_dict["estimated_tool_calls"],
+    )
+
     # Step 4: Construct the Pydantic model
     try:
         query_plan = QueryPlan.model_validate(plan_dict)
