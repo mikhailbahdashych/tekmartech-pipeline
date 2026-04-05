@@ -25,12 +25,16 @@ provided.\
 OUTPUT_FORMAT_SECTION = """\
 ## Response Format
 
-Respond in two parts.
+Your response MUST have exactly two sections in this order:
 
-PART 1: Write a brief analysis (2-4 sentences) explaining what the user \
-is asking and which tools you will use.
+### Analysis
+Write 2-4 sentences explaining:
+- What the user is asking for
+- Which tool(s) you will use and from which integration
+- Any assumptions you are making
 
-PART 2: Output a JSON execution plan between these exact markers:
+### Plan
+After your analysis, output the JSON execution plan between these exact markers:
 
 ---PLAN_START---
 <your JSON here>
