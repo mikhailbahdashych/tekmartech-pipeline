@@ -108,15 +108,49 @@ async def interpret_stream(
         return
 
     # Stream LLM response
+    # Stop sending text deltas once "### Plan" appears — everything
+    # after that heading is machine-readable and should not reach the
+    # frontend. The plan data arrives in the terminal event instead.
+    # We track how much of full_text has been sent to the frontend and
+    # hold back the last few characters in case the marker is split
+    # across chunk boundaries.
     full_text = ""
+    sent_length = 0
+    plan_heading_seen = False
+    _PLAN_MARKER = "### Plan"
     try:
         async for chunk in provider.stream_completion(
             system_prompt, user_message, settings.LLM_MAX_TOKENS
         ):
             full_text += chunk
+            if not plan_heading_seen:
+                marker_pos = full_text.find(_PLAN_MARKER)
+                if marker_pos != -1:
+                    plan_heading_seen = True
+                    unsent = full_text[sent_length:marker_pos]
+                    if unsent:
+                        yield InterpretationTextDelta(
+                            query_id=query_id,
+                            text_delta=unsent,
+                            timestamp=_now_iso(),
+                        )
+                else:
+                    # Hold back enough to cover a partial marker at the tail
+                    safe_end = max(sent_length, len(full_text) - len(_PLAN_MARKER) + 1)
+                    unsent = full_text[sent_length:safe_end]
+                    if unsent:
+                        yield InterpretationTextDelta(
+                            query_id=query_id,
+                            text_delta=unsent,
+                            timestamp=_now_iso(),
+                        )
+                    sent_length = safe_end
+
+        # Flush any buffered tail if the marker never appeared
+        if not plan_heading_seen and sent_length < len(full_text):
             yield InterpretationTextDelta(
                 query_id=query_id,
-                text_delta=chunk,
+                text_delta=full_text[sent_length:],
                 timestamp=_now_iso(),
             )
 
