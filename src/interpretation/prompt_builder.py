@@ -1,16 +1,20 @@
 """System prompt construction for the Interpreter.
 
 Translates a tool_catalog into an LLM prompt that instructs the AI
-to analyze an infrastructure query and produce a structured query plan.
+to analyze an infrastructure query and produce either a structured
+query plan or a clarification question. Supports multi-turn conversation
+by converting conversation_history into an LLM messages list.
+
 The prompt tells the LLM to produce ONLY the intelligence fields (tool
 selection, parameters, reasoning). Mechanical fields (plan_id, plan_version,
-step_id, estimated_tool_calls) are injected by the parser after the fact.
+step_id, estimated_tool_calls, clarification_id) are injected by the parser.
 """
 
 import json
 
 import structlog
 
+from src.models.conversation import AssistantTurn, UserTurn
 from src.models.tool_catalog import ToolCatalog
 
 logger = structlog.get_logger(__name__)
@@ -33,14 +37,16 @@ Write 2-4 sentences explaining:
 - Which tool(s) you will use and from which integration
 - Any assumptions you are making
 
-### Plan
-After your analysis, output the JSON execution plan between these exact markers:
+### Structured Output
+Your response must end with EXACTLY ONE of these blocks:
+
+**Option A — If you have enough information to create a plan:**
 
 ---PLAN_START---
-<your JSON here>
+<your plan JSON here>
 ---PLAN_END---
 
-The JSON must have this exact structure:
+The plan JSON must have this exact structure:
 {
   "steps": [ ... ],
   "summary": "..."
@@ -65,7 +71,45 @@ The "summary" field is a one-sentence explanation of the entire plan for a \
 non-technical person.
 
 Do NOT include plan_id, plan_version, step_id, or estimated_tool_calls. \
-These are added automatically by the system.\
+These are added automatically by the system.
+
+**Option B — If the query is ambiguous and you need more information:**
+
+---CLARIFICATION_START---
+{
+  "question": "Your clarification question in natural language",
+  "options": [
+    { "option_id": "opt_1", "label": "Short label", "description": "Optional explanation" },
+    { "option_id": "opt_2", "label": "Another choice" }
+  ],
+  "allows_free_text": true
+}
+---CLARIFICATION_END---
+
+IMPORTANT: Output EITHER a plan OR a clarification, NEVER both.\
+"""
+
+CLARIFICATION_GUIDANCE_SECTION = """\
+## When to Ask for Clarification
+
+Ask a clarification question ONLY when:
+- The query is genuinely ambiguous (could mean different things)
+- Multiple integrations of the same type exist and the user did not specify \
+which one (e.g., "check our AWS" when Production AWS and Staging AWS are both connected)
+- The query could be answered at very different levels of detail and you need \
+to know what the user wants
+
+Do NOT ask for clarification when:
+- The query is clear and can be answered directly
+- There is only one integration of the relevant type
+- You can make a reasonable default assumption
+
+When in doubt, generate a plan. Users prefer getting results they can refine \
+over being asked unnecessary questions.
+
+Keep clarification questions concise (1-2 sentences). Provide 2-4 options \
+when possible. Always set allows_free_text to true unless the choices are \
+strictly enumerated.\
 """
 
 CONSTRAINTS_SECTION = """\
@@ -77,7 +121,8 @@ CONSTRAINTS_SECTION = """\
 and do NOT output ---PLAN_START---.
 5. Use the fewest steps possible.
 6. Do NOT include plan_id, plan_version, step_id, or estimated_tool_calls \
-in your JSON.\
+in your JSON.
+7. Ask for clarification only when genuinely ambiguous. Prefer producing a plan.\
 """
 
 
@@ -86,8 +131,8 @@ def _build_dynamic_example(tool_catalog: ToolCatalog) -> str:
 
     Uses the first integration with at least one tool to construct
     an example, so the LLM sees consistent IDs between the catalog
-    and the example. This prevents smaller models from copying
-    hardcoded fake IDs.
+    and the example. If the catalog has 2+ integrations, also shows
+    a brief clarification example using real integration names.
 
     Args:
         tool_catalog: The filtered tool catalog for this query.
@@ -107,7 +152,7 @@ def _build_dynamic_example(tool_catalog: ToolCatalog) -> str:
     tool = integration.tools[0]
     tool_action = tool.tool_name.split(".")[-1].replace("_", " ")
 
-    return f"""## Example using your catalog
+    example = f"""## Example using your catalog
 
 ---PLAN_START---
 {{
@@ -123,6 +168,28 @@ def _build_dynamic_example(tool_catalog: ToolCatalog) -> str:
   "summary": "Use {tool.display_name} to {tool_action} from {integration.display_name}."
 }}
 ---PLAN_END---"""
+
+    # Add clarification example if catalog has 2+ integrations with tools
+    integrations_with_tools = [i for i in tool_catalog.integrations if i.tools]
+    if len(integrations_with_tools) >= 2:
+        first = integrations_with_tools[0]
+        second = integrations_with_tools[1]
+        example += f"""
+
+If you need clarification, for example to ask which integration to query:
+
+---CLARIFICATION_START---
+{{
+  "question": "Which integration would you like me to query?",
+  "options": [
+    {{ "option_id": "opt_1", "label": "{first.display_name}" }},
+    {{ "option_id": "opt_2", "label": "{second.display_name}" }}
+  ],
+  "allows_free_text": true
+}}
+---CLARIFICATION_END---"""
+
+    return example
 
 
 def _format_tool_catalog(tool_catalog: ToolCatalog) -> str:
@@ -176,18 +243,78 @@ def _has_tools(tool_catalog: ToolCatalog) -> bool:
     return any(len(integration.tools) > 0 for integration in tool_catalog.integrations)
 
 
+def _format_user_turn(turn: UserTurn) -> str:
+    """Convert a UserTurn model to a natural language message string.
+
+    Args:
+        turn: The user turn from conversation history.
+
+    Returns:
+        Formatted string representing the user's response.
+    """
+    if turn.response_type == "option_selection" and turn.selected_option_id:
+        content = f"I choose: {turn.selected_option_id}"
+        if turn.text:
+            content += f". {turn.text}"
+        return content
+    return turn.text or ""
+
+
+def _build_messages(
+    query_text: str,
+    conversation_history: list[AssistantTurn | UserTurn] | None,
+) -> list[dict[str, str]]:
+    """Build the LLM messages list from query text and conversation history.
+
+    For first turn (no history): returns a single user message with the query.
+    For continuation turns: reconstructs the full conversation as alternating
+    user/assistant messages, ending with the user's latest response.
+
+    Args:
+        query_text: The original user query.
+        conversation_history: Previous conversation turns, or None.
+
+    Returns:
+        List of message dicts with "role" and "content" keys.
+    """
+    messages: list[dict[str, str]] = [{"role": "user", "content": query_text}]
+
+    if not conversation_history:
+        return messages
+
+    for turn in conversation_history:
+        if isinstance(turn, AssistantTurn):
+            messages.append({"role": "assistant", "content": turn.content})
+        elif isinstance(turn, UserTurn):
+            content = _format_user_turn(turn)
+            messages.append({"role": "user", "content": content})
+
+    # Final user message to prompt the LLM to continue
+    messages.append({
+        "role": "user",
+        "content": "Based on my response, please continue your analysis and generate the execution plan.",
+    })
+
+    return messages
+
+
 def build_interpretation_prompt(
     query_text: str,
     tool_catalog: ToolCatalog,
-) -> tuple[str, str]:
-    """Build the system prompt and user message for the Interpreter.
+    conversation_history: list[AssistantTurn | UserTurn] | None = None,
+) -> tuple[str, list[dict[str, str]]]:
+    """Build the system prompt and messages list for the Interpreter.
+
+    For single-turn (no history): system prompt + one user message.
+    For multi-turn (with history): system prompt + full conversation messages.
 
     Args:
         query_text: The user's natural language question.
         tool_catalog: The filtered tool catalog for this query.
+        conversation_history: Previous turns for multi-turn, or None.
 
     Returns:
-        Tuple of (system_prompt, user_message).
+        Tuple of (system_prompt, messages_list).
 
     Raises:
         ValueError: If the tool catalog has no integrations or no tools.
@@ -196,6 +323,7 @@ def build_interpretation_prompt(
         "building interpretation prompt",
         action="build_prompt",
         integration_count=len(tool_catalog.integrations),
+        has_history=conversation_history is not None and len(conversation_history) > 0,
     )
 
     if not tool_catalog.integrations or not _has_tools(tool_catalog):
@@ -213,14 +341,18 @@ def build_interpretation_prompt(
             catalog_section,
             OUTPUT_FORMAT_SECTION,
             example_section,
+            CLARIFICATION_GUIDANCE_SECTION,
             CONSTRAINTS_SECTION,
         ]
     )
+
+    messages = _build_messages(query_text, conversation_history)
 
     logger.info(
         "interpretation prompt built",
         action="build_prompt",
         prompt_length=len(system_prompt),
+        message_count=len(messages),
     )
 
-    return system_prompt, query_text
+    return system_prompt, messages

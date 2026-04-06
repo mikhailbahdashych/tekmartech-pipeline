@@ -1,9 +1,10 @@
 """Interpretation orchestrator — coordinates the full /interpret flow.
 
-This async generator replaces the mock implementation. It builds a prompt,
-streams the LLM response as text deltas, parses the plan, validates it
-against the catalog, and emits the appropriate terminal event. Every
-stream is guaranteed to end with exactly one terminal event.
+This async generator builds a prompt, streams the LLM response as text
+deltas, parses the output (plan or clarification), validates it against
+the catalog, and emits the appropriate terminal event. Supports multi-turn
+conversation via optional conversation_history. Every stream is guaranteed
+to end with exactly one terminal event.
 """
 
 import asyncio
@@ -25,7 +26,9 @@ from src.llm.exceptions import (
     LLMUnavailableError,
 )
 from src.llm.provider import LLMProvider
+from src.models.conversation import AssistantTurn, UserTurn
 from src.models.stream_events import (
+    InterpretationClarificationNeeded,
     InterpretationError,
     InterpretationFailed,
     InterpretationPlanGenerated,
@@ -35,6 +38,11 @@ from src.models.stream_events import (
 from src.models.tool_catalog import ToolCatalog
 
 logger = structlog.get_logger(__name__)
+
+# Markers that indicate the start of machine-readable output.
+# Text deltas stop streaming to the frontend once any of these appear.
+_STOP_MARKERS = ["### Structured Output", "---PLAN_START---", "---CLARIFICATION_START---"]
+_MAX_MARKER_LEN = max(len(m) for m in _STOP_MARKERS)
 
 
 def _now_iso() -> str:
@@ -54,18 +62,36 @@ def _estimate_duration(estimated_tool_calls: int) -> int:
     return max(estimated_tool_calls * 3, 1)
 
 
+def _find_first_marker(text: str) -> int | None:
+    """Find the position of the first stop marker in the text.
+
+    Args:
+        text: The accumulated LLM output text.
+
+    Returns:
+        The index of the first marker found, or None if no marker is present.
+    """
+    first_pos = None
+    for marker in _STOP_MARKERS:
+        pos = text.find(marker)
+        if pos != -1 and (first_pos is None or pos < first_pos):
+            first_pos = pos
+    return first_pos
+
+
 async def interpret_stream(
     query_id: str,
     query_text: str,
     tool_catalog: ToolCatalog,
     provider: LLMProvider,
     settings: Settings,
+    conversation_history: list[AssistantTurn | UserTurn] | None = None,
 ) -> AsyncGenerator[BaseModel, None]:
     """Generate the interpretation NDJSON event stream.
 
-    Coordinates: prompt building → LLM streaming → plan parsing →
-    catalog validation → terminal event emission. Guarantees exactly
-    one terminal event is emitted regardless of success or failure.
+    Coordinates: prompt building → LLM streaming → output parsing
+    (plan or clarification) → catalog validation → terminal event.
+    Guarantees exactly one terminal event regardless of outcome.
 
     Args:
         query_id: UUID of the query being interpreted.
@@ -73,6 +99,7 @@ async def interpret_stream(
         tool_catalog: Filtered tool catalog for this query.
         provider: The LLM provider to use for completion.
         settings: Application settings.
+        conversation_history: Previous turns for multi-turn, or None.
 
     Yields:
         Pydantic event models for NDJSON serialization.
@@ -81,6 +108,7 @@ async def interpret_stream(
         "starting interpretation stream",
         action="interpret_stream",
         query_id=query_id,
+        has_history=conversation_history is not None and len(conversation_history) > 0,
     )
 
     try:
@@ -92,7 +120,9 @@ async def interpret_stream(
 
         # Build prompt
         try:
-            system_prompt, user_message = build_interpretation_prompt(query_text, tool_catalog)
+            system_prompt, messages = build_interpretation_prompt(
+                query_text, tool_catalog, conversation_history
+            )
         except ValueError as exc:
             logger.error(
                 "prompt building failed",
@@ -110,25 +140,22 @@ async def interpret_stream(
             return
 
         # Stream LLM response
-        # Stop sending text deltas once "### Plan" appears — everything
-        # after that heading is machine-readable and should not reach the
-        # frontend. The plan data arrives in the terminal event instead.
-        # We track how much of full_text has been sent to the frontend and
-        # hold back the last few characters in case the marker is split
-        # across chunk boundaries.
+        # Stop sending text deltas once any stop marker appears — everything
+        # after is machine-readable (plan or clarification JSON) and should
+        # not reach the frontend. We track how much of full_text has been
+        # sent and hold back characters to handle markers split across chunks.
         full_text = ""
         sent_length = 0
-        plan_heading_seen = False
-        _PLAN_MARKER = "### Plan"
+        cutoff_found = False
         try:
             async for chunk in provider.stream_completion(
-                system_prompt, user_message, settings.LLM_MAX_TOKENS
+                system_prompt, messages, settings.LLM_MAX_TOKENS
             ):
                 full_text += chunk
-                if not plan_heading_seen:
-                    marker_pos = full_text.find(_PLAN_MARKER)
-                    if marker_pos != -1:
-                        plan_heading_seen = True
+                if not cutoff_found:
+                    marker_pos = _find_first_marker(full_text)
+                    if marker_pos is not None:
+                        cutoff_found = True
                         unsent = full_text[sent_length:marker_pos]
                         if unsent:
                             yield InterpretationTextDelta(
@@ -138,7 +165,7 @@ async def interpret_stream(
                             )
                     else:
                         # Hold back enough to cover a partial marker at the tail
-                        safe_end = max(sent_length, len(full_text) - len(_PLAN_MARKER) + 1)
+                        safe_end = max(sent_length, len(full_text) - _MAX_MARKER_LEN + 1)
                         unsent = full_text[sent_length:safe_end]
                         if unsent:
                             yield InterpretationTextDelta(
@@ -148,8 +175,8 @@ async def interpret_stream(
                             )
                         sent_length = safe_end
 
-            # Flush any buffered tail if the marker never appeared
-            if not plan_heading_seen and sent_length < len(full_text):
+            # Flush any buffered tail if no marker ever appeared
+            if not cutoff_found and sent_length < len(full_text):
                 yield InterpretationTextDelta(
                     query_id=query_id,
                     text_delta=full_text[sent_length:],
@@ -216,9 +243,29 @@ async def interpret_stream(
             )
             return
 
-        # Parse plan from accumulated text
+        # Parse output (plan or clarification) from accumulated text
         result = parse_plan_from_llm_output(full_text)
 
+        # Clarification path (new: multi-turn)
+        if result.clarification is not None:
+            logger.info(
+                "clarification requested by LLM",
+                action="interpret_stream",
+                query_id=query_id,
+                clarification_id=result.clarification.clarification_id,
+            )
+            yield InterpretationClarificationNeeded(
+                query_id=query_id,
+                clarification_id=result.clarification.clarification_id,
+                question=result.clarification.question,
+                options=result.clarification.options,
+                allows_free_text=result.clarification.allows_free_text,
+                full_interpretation_text=result.analysis_text,
+                timestamp=_now_iso(),
+            )
+            return
+
+        # No plan and no clarification — failure
         if result.query_plan is None:
             logger.info(
                 "no plan produced by LLM",
@@ -256,7 +303,7 @@ async def interpret_stream(
             )
             return
 
-        # Success
+        # Success — plan generated
         logger.info(
             "interpretation completed successfully",
             action="interpret_stream",

@@ -10,6 +10,7 @@ from typing import Literal
 
 from pydantic import BaseModel
 
+from src.models.conversation import ClarificationOption
 from src.models.query_plan import QueryPlan
 from src.models.result_data import ResultData
 from src.models.transparency_log import TransparencyLog
@@ -88,6 +89,34 @@ class InterpretationFailed(BaseModel):
     error_code: str
     error_message: str
     full_interpretation_text: str | None = None
+    timestamp: str
+
+
+class InterpretationClarificationNeeded(BaseModel):
+    """Terminal event when the Interpreter needs clarification from the user.
+
+    Ends the current streaming response. The Application API stores this
+    as a conversation turn and waits for the user's response before
+    calling POST /interpret again with conversation_history.
+
+    Attributes:
+        event: Literal event type identifier.
+        query_id: UUID of the query.
+        clarification_id: UUID for this clarification request.
+        question: The AI's clarification question in natural language.
+        options: Structured choices for the user, if applicable.
+        allows_free_text: Whether the user can type a free-text response.
+        full_interpretation_text: Complete AI analysis text from this turn.
+        timestamp: ISO 8601 timestamp.
+    """
+
+    event: Literal["interpretation_clarification_needed"] = "interpretation_clarification_needed"
+    query_id: str
+    clarification_id: str
+    question: str
+    options: list[ClarificationOption] | None = None
+    allows_free_text: bool = True
+    full_interpretation_text: str
     timestamp: str
 
 

@@ -80,14 +80,17 @@ class OllamaProvider(LLMProvider):
     async def stream_completion(
         self,
         system_prompt: str,
-        user_message: str,
+        messages: list[dict[str, str]],
         max_tokens: int,
     ) -> AsyncIterator[str]:
-        """Yield text chunks from the Ollama API.
+        """Yield text chunks from the Ollama chat API.
+
+        Uses the /api/chat endpoint which supports multi-turn conversation
+        via a messages array.
 
         Args:
             system_prompt: The system-level instructions.
-            user_message: The user's message (query_text).
+            messages: Conversation messages with role/content dicts.
             max_tokens: Maximum tokens in the response.
 
         Yields:
@@ -105,10 +108,11 @@ class OllamaProvider(LLMProvider):
             base_url=self._base_url,
         )
 
+        ollama_messages = [{"role": "system", "content": system_prompt}] + messages
+
         payload = {
             "model": self._model,
-            "system": system_prompt,
-            "prompt": user_message,
+            "messages": ollama_messages,
             "stream": True,
             "options": {
                 "temperature": self._temperature,
@@ -119,14 +123,14 @@ class OllamaProvider(LLMProvider):
         try:
             async with (
                 httpx.AsyncClient(base_url=self._base_url, timeout=120.0) as client,
-                client.stream("POST", "/api/generate", json=payload) as response,
+                client.stream("POST", "/api/chat", json=payload) as response,
             ):
                 response.raise_for_status()
                 async for line in response.aiter_lines():
                     if not line.strip():
                         continue
                     chunk_data = json.loads(line)
-                    text = chunk_data.get("response", "")
+                    text = chunk_data.get("message", {}).get("content", "")
                     if text:
                         yield text
                     if chunk_data.get("done", False):

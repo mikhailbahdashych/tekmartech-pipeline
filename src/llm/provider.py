@@ -59,14 +59,17 @@ class LLMProvider(ABC):
     async def stream_completion(
         self,
         system_prompt: str,
-        user_message: str,
+        messages: list[dict[str, str]],
         max_tokens: int,
     ) -> AsyncIterator[str]:
         """Yield text chunks as the LLM generates them.
 
         Args:
             system_prompt: The system-level instructions for the LLM.
-            user_message: The user's message (query_text).
+            messages: List of conversation messages, each with "role"
+                and "content" keys. Minimum one message with role "user".
+                For single-turn: [{"role": "user", "content": query_text}].
+                For multi-turn: alternating user/assistant messages.
             max_tokens: Maximum tokens in the LLM response.
 
         Yields:

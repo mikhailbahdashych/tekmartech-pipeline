@@ -76,14 +76,14 @@ class AnthropicProvider(LLMProvider):
     async def stream_completion(
         self,
         system_prompt: str,
-        user_message: str,
+        messages: list[dict[str, str]],
         max_tokens: int,
     ) -> AsyncIterator[str]:
         """Yield text chunks from the Anthropic Claude API.
 
         Args:
             system_prompt: The system-level instructions.
-            user_message: The user's message (query_text).
+            messages: Conversation messages with role/content dicts.
             max_tokens: Maximum tokens in the response.
 
         Yields:
@@ -108,7 +108,7 @@ class AnthropicProvider(LLMProvider):
                 max_tokens=max_tokens,
                 temperature=self._temperature,
                 system=system_prompt,
-                messages=[{"role": "user", "content": user_message}],
+                messages=messages,
             ) as stream:
                 async for text in stream.text_stream:
                     yield text
