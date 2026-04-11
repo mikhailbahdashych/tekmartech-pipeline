@@ -1,11 +1,11 @@
-"""Plan parser for extracting query plans from LLM output.
+"""Plan and clarification parser for LLM output.
 
-Extracts the natural language analysis and structured query plan from
-the complete LLM response text. The LLM produces only intelligence fields
-(tool_name, integration_id, parameters, description, output_alias, summary).
-The parser injects all mechanical fields (plan_id, plan_version, step_id,
-estimated_tool_calls) and validates against the Pydantic model and the
-tool catalog (Architectural Invariant #5).
+Extracts the natural language analysis and either a structured query plan
+or a clarification question from the complete LLM response text. The LLM
+produces only intelligence fields. The parser injects all mechanical fields
+(plan_id, plan_version, step_id, estimated_tool_calls, clarification_id)
+and validates against the Pydantic model and the tool catalog
+(Architectural Invariant #5).
 """
 
 import json
@@ -14,6 +14,7 @@ from dataclasses import dataclass
 
 import structlog
 
+from src.models.conversation import ClarificationOption, ClarificationQuestion
 from src.models.query_plan import QueryPlan
 from src.models.tool_catalog import ToolCatalog
 
@@ -21,20 +22,27 @@ logger = structlog.get_logger(__name__)
 
 PLAN_START_DELIMITER = "---PLAN_START---"
 PLAN_END_DELIMITER = "---PLAN_END---"
+CLARIFICATION_START_DELIMITER = "---CLARIFICATION_START---"
+CLARIFICATION_END_DELIMITER = "---CLARIFICATION_END---"
 
 
 @dataclass
 class ParseResult:
-    """Result of parsing LLM output for a query plan.
+    """Result of parsing LLM output for a query plan or clarification.
+
+    Exactly one of query_plan or clarification should be set on success.
+    If both are None and error_message is set, parsing failed.
 
     Attributes:
-        analysis_text: The natural language analysis (before the plan block).
-        query_plan: The parsed and validated QueryPlan, or None if not found.
+        analysis_text: The natural language analysis (before the structured block).
+        query_plan: The parsed and validated QueryPlan, or None.
+        clarification: The parsed ClarificationQuestion, or None.
         error_message: Explanation if parsing or validation failed.
     """
 
     analysis_text: str
     query_plan: QueryPlan | None
+    clarification: ClarificationQuestion | None
     error_message: str | None
 
 
@@ -58,6 +66,109 @@ def _extract_plan_json(full_text: str) -> tuple[str, str | None]:
     plan_json = after_start.strip() if end_idx == -1 else after_start[:end_idx].strip()
 
     return analysis_text, plan_json
+
+
+def _extract_clarification_json(full_text: str) -> tuple[str, str | None]:
+    """Extract clarification JSON using ---CLARIFICATION_START--- / ---CLARIFICATION_END---.
+
+    Args:
+        full_text: The complete LLM output.
+
+    Returns:
+        Tuple of (analysis_text, clarification_json_string or None).
+    """
+    start_idx = full_text.find(CLARIFICATION_START_DELIMITER)
+    if start_idx == -1:
+        return full_text.strip(), None
+
+    analysis_text = full_text[:start_idx].strip()
+    after_start = full_text[start_idx + len(CLARIFICATION_START_DELIMITER) :]
+
+    end_idx = after_start.find(CLARIFICATION_END_DELIMITER)
+    clar_json = after_start.strip() if end_idx == -1 else after_start[:end_idx].strip()
+
+    return analysis_text, clar_json
+
+
+def _parse_clarification(clar_json: str, analysis_text: str) -> ParseResult:
+    """Parse and validate a clarification JSON block.
+
+    Generates the clarification_id (UUID) and normalizes option IDs.
+
+    Args:
+        clar_json: The raw JSON string from between the delimiters.
+        analysis_text: The analysis text preceding the clarification block.
+
+    Returns:
+        ParseResult with the clarification field populated, or error_message on failure.
+    """
+    try:
+        clar_dict = json.loads(clar_json)
+    except json.JSONDecodeError as exc:
+        logger.warn(
+            "invalid JSON in clarification block",
+            action="parse_clarification",
+            error=str(exc),
+        )
+        return ParseResult(
+            analysis_text=analysis_text,
+            query_plan=None,
+            clarification=None,
+            error_message=f"Invalid JSON in clarification block: {exc}",
+        )
+
+    # Validate required field: question
+    question = clar_dict.get("question")
+    if not isinstance(question, str) or not question.strip():
+        return ParseResult(
+            analysis_text=analysis_text,
+            query_plan=None,
+            clarification=None,
+            error_message="Clarification has no question.",
+        )
+
+    # Parse and normalize options
+    raw_options = clar_dict.get("options")
+    options: list[ClarificationOption] | None = None
+    if isinstance(raw_options, list) and len(raw_options) > 0:
+        options = []
+        for i, opt in enumerate(raw_options):
+            if not isinstance(opt, dict):
+                continue
+            # Normalize: accept "id" or "option_id"
+            option_id = opt.get("option_id") or opt.get("id") or f"opt_{i + 1}"
+            label = opt.get("label", f"Option {i + 1}")
+            description = opt.get("description")
+            options.append(
+                ClarificationOption(
+                    option_id=str(option_id),
+                    label=str(label),
+                    description=str(description) if description else None,
+                )
+            )
+
+    allows_free_text = clar_dict.get("allows_free_text", True)
+
+    clarification = ClarificationQuestion(
+        clarification_id=str(uuid.uuid4()),
+        question=question.strip(),
+        options=options if options else None,
+        allows_free_text=bool(allows_free_text),
+    )
+
+    logger.info(
+        "clarification parsed successfully",
+        action="parse_clarification",
+        clarification_id=clarification.clarification_id,
+        has_options=clarification.options is not None,
+    )
+
+    return ParseResult(
+        analysis_text=analysis_text,
+        query_plan=None,
+        clarification=clarification,
+        error_message=None,
+    )
 
 
 def _validate_llm_fields(plan_dict: dict) -> str | None:
@@ -141,25 +252,39 @@ def _inject_mechanical_fields(plan_dict: dict) -> str | None:
             estimated += 1
     plan_dict["estimated_tool_calls"] = estimated
 
-    # Validate cross-references
+    # Build lookups for cross-reference resolution
     valid_step_ids = {step["step_id"] for step in steps}
     step_id_indices = {step["step_id"]: i for i, step in enumerate(steps)}
 
+    # The LLM sometimes uses output_alias instead of step_id in depends_on
+    # and iterate_over.source_step (because we tell it not to produce step_ids).
+    # Build a mapping to resolve these references.
+    alias_to_step_id = {step["output_alias"]: step["step_id"] for step in steps}
+
+    def _resolve_ref(ref: str) -> str:
+        """Resolve a cross-reference to a valid step_id."""
+        if ref in valid_step_ids:
+            return ref
+        return alias_to_step_id.get(ref, ref)
+
+    # Remap and validate cross-references
     for step in steps:
         step_id = step["step_id"]
         step_idx = step_id_indices[step_id]
 
-        # Validate depends_on
+        # Remap and validate depends_on
         if step.get("depends_on"):
+            step["depends_on"] = [_resolve_ref(dep) for dep in step["depends_on"]]
             for dep_id in step["depends_on"]:
                 if dep_id not in valid_step_ids:
                     return f"Step {step_id} references non-existent step {dep_id}."
                 if step_id_indices[dep_id] >= step_idx:
                     return f"Step {step_id} references non-existent step {dep_id}."
 
-        # Validate iterate_over.source_step
+        # Remap and validate iterate_over.source_step
         if step.get("iterate_over"):
-            source = step["iterate_over"].get("source_step", "")
+            source = _resolve_ref(step["iterate_over"].get("source_step", ""))
+            step["iterate_over"]["source_step"] = source
             if source not in valid_step_ids:
                 return f"Step {step_id} references non-existent step {source}."
             if step_id_indices[source] >= step_idx:
@@ -169,20 +294,17 @@ def _inject_mechanical_fields(plan_dict: dict) -> str | None:
 
 
 def parse_plan_from_llm_output(full_text: str) -> ParseResult:
-    """Parse the LLM output to extract analysis text and query plan.
+    """Parse the LLM output to extract analysis text and either a query plan or clarification.
 
-    Strict 5-step process:
-    1. Extract JSON between ---PLAN_START--- and ---PLAN_END---.
-    2. Validate LLM-produced fields (tool_name, integration_id, etc.).
-    3. Inject mechanical fields (plan_id, plan_version, step_id, etc.).
-    4. Construct the Pydantic QueryPlan model.
-    5. (Catalog validation is done separately via validate_plan_against_catalog.)
+    Checks for both ---PLAN_START--- and ---CLARIFICATION_START--- delimiters.
+    If both are present, returns an error. If a plan is found, validates and
+    injects mechanical fields. If a clarification is found, parses and validates it.
 
     Args:
         full_text: The complete accumulated LLM output text.
 
     Returns:
-        ParseResult with analysis_text, query_plan (or None), and error_message.
+        ParseResult with analysis_text and either query_plan, clarification, or error_message.
     """
     logger.debug(
         "parsing plan from LLM output",
@@ -190,7 +312,29 @@ def parse_plan_from_llm_output(full_text: str) -> ParseResult:
         text_length=len(full_text),
     )
 
-    # Step 1: Extract JSON
+    # Check for both delimiters
+    _, plan_json = _extract_plan_json(full_text)
+    analysis_text_clar, clarification_json = _extract_clarification_json(full_text)
+
+    # Error if both present
+    if plan_json is not None and clarification_json is not None:
+        analysis_text, _ = _extract_plan_json(full_text)
+        logger.warn(
+            "LLM produced both plan and clarification",
+            action="parse_plan",
+        )
+        return ParseResult(
+            analysis_text=analysis_text,
+            query_plan=None,
+            clarification=None,
+            error_message="LLM output contains both a plan and a clarification request.",
+        )
+
+    # Handle clarification path
+    if clarification_json is not None:
+        return _parse_clarification(clarification_json, analysis_text_clar)
+
+    # Handle plan path (existing logic)
     analysis_text, plan_json = _extract_plan_json(full_text)
 
     if plan_json is None:
@@ -201,6 +345,7 @@ def parse_plan_from_llm_output(full_text: str) -> ParseResult:
         return ParseResult(
             analysis_text=analysis_text,
             query_plan=None,
+            clarification=None,
             error_message="No plan block found in LLM output.",
         )
 
@@ -215,6 +360,7 @@ def parse_plan_from_llm_output(full_text: str) -> ParseResult:
         return ParseResult(
             analysis_text=analysis_text,
             query_plan=None,
+            clarification=None,
             error_message=f"Invalid JSON in plan block: {exc}",
         )
 
@@ -229,6 +375,7 @@ def parse_plan_from_llm_output(full_text: str) -> ParseResult:
         return ParseResult(
             analysis_text=analysis_text,
             query_plan=None,
+            clarification=None,
             error_message=validation_error,
         )
 
@@ -243,6 +390,7 @@ def parse_plan_from_llm_output(full_text: str) -> ParseResult:
         return ParseResult(
             analysis_text=analysis_text,
             query_plan=None,
+            clarification=None,
             error_message=injection_error,
         )
 
@@ -267,6 +415,7 @@ def parse_plan_from_llm_output(full_text: str) -> ParseResult:
         return ParseResult(
             analysis_text=analysis_text,
             query_plan=None,
+            clarification=None,
             error_message=f"Plan does not conform to required schema: {exc}",
         )
 
@@ -279,6 +428,7 @@ def parse_plan_from_llm_output(full_text: str) -> ParseResult:
     return ParseResult(
         analysis_text=analysis_text,
         query_plan=query_plan,
+        clarification=None,
         error_message=None,
     )
 

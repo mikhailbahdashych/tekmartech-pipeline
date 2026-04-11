@@ -48,6 +48,11 @@ def _wrap_plan(plan_dict: dict, analysis: str = "Analysis text here.") -> str:
     return f"{analysis}\n\n---PLAN_START---\n{json.dumps(plan_dict)}\n---PLAN_END---"
 
 
+def _wrap_clarification(clar_dict: dict, analysis: str = "Analysis text here.") -> str:
+    """Wrap a clarification dict into full LLM output with delimiters."""
+    return f"{analysis}\n\n---CLARIFICATION_START---\n{json.dumps(clar_dict)}\n---CLARIFICATION_END---"
+
+
 def _minimal_plan(**overrides) -> dict:
     """Build a minimal valid LLM plan dict (no mechanical fields)."""
     plan = {
@@ -66,13 +71,28 @@ def _minimal_plan(**overrides) -> dict:
     return plan
 
 
+def _minimal_clarification(**overrides) -> dict:
+    """Build a minimal valid clarification dict."""
+    clar = {
+        "question": "Which AWS account should I query?",
+        "options": [
+            {"option_id": "opt_1", "label": "Production AWS"},
+            {"option_id": "opt_2", "label": "Staging AWS"},
+        ],
+        "allows_free_text": True,
+    }
+    clar.update(overrides)
+    return clar
+
+
 class TestValidParse:
-    """Parser correctly handles well-formed LLM output."""
+    """Parser correctly handles well-formed LLM output with a plan."""
 
     def test_parses_valid_plan(self):
         text = _wrap_plan(_minimal_plan())
         result = parse_plan_from_llm_output(text)
         assert result.query_plan is not None
+        assert result.clarification is None
         assert result.error_message is None
 
     def test_extracts_analysis_text(self):
@@ -84,7 +104,6 @@ class TestValidParse:
         text = _wrap_plan(_minimal_plan())
         result = parse_plan_from_llm_output(text)
         plan = result.query_plan
-        # Should be a valid UUID
         uuid.UUID(plan.plan_id)
 
     def test_injects_plan_version(self):
@@ -124,7 +143,6 @@ class TestValidParse:
         assert result.query_plan.estimated_tool_calls > 0
 
     def test_ignores_llm_provided_mechanical_fields(self):
-        """If LLM includes plan_id etc., they get overwritten."""
         plan_dict = _minimal_plan()
         plan_dict["plan_id"] = "bad-id"
         plan_dict["plan_version"] = "99.0"
@@ -148,6 +166,7 @@ class TestMissingFields:
         text = _wrap_plan(plan_dict)
         result = parse_plan_from_llm_output(text)
         assert result.query_plan is None
+        assert result.clarification is None
         assert "tool_name" in result.error_message
 
     def test_missing_integration_id(self):
@@ -205,6 +224,7 @@ class TestExtractionErrors:
         text = "Just some analysis text without any plan."
         result = parse_plan_from_llm_output(text)
         assert result.query_plan is None
+        assert result.clarification is None
         assert "No plan block" in result.error_message
 
     def test_invalid_json_between_markers(self):
@@ -311,6 +331,64 @@ class TestCrossReferences:
         result = parse_plan_from_llm_output(text)
         assert result.query_plan is not None
 
+    def test_depends_on_using_output_alias_resolved(self):
+        """LLM uses output_alias instead of step_id in depends_on — parser resolves it."""
+        plan_dict = {
+            "steps": [
+                {
+                    "tool_name": TOOL_NAME,
+                    "integration_id": INTEGRATION_ID,
+                    "parameters": {},
+                    "description": "List repos",
+                    "output_alias": "org_repos",
+                },
+                {
+                    "tool_name": "github.get_branch_protection",
+                    "integration_id": INTEGRATION_ID,
+                    "parameters": {},
+                    "description": "Check protection",
+                    "output_alias": "protections",
+                    "depends_on": ["org_repos"],
+                },
+            ],
+            "summary": "Plan where LLM used output_alias in depends_on.",
+        }
+        text = _wrap_plan(plan_dict)
+        result = parse_plan_from_llm_output(text)
+        assert result.query_plan is not None
+        assert result.query_plan.steps[1].depends_on == ["step_1"]
+
+    def test_iterate_over_using_output_alias_resolved(self):
+        """LLM uses output_alias in iterate_over.source_step — parser resolves it."""
+        plan_dict = {
+            "steps": [
+                {
+                    "tool_name": TOOL_NAME,
+                    "integration_id": INTEGRATION_ID,
+                    "parameters": {},
+                    "description": "List repos",
+                    "output_alias": "org_repos",
+                },
+                {
+                    "tool_name": "github.get_branch_protection",
+                    "integration_id": INTEGRATION_ID,
+                    "parameters": {},
+                    "description": "Check per repo",
+                    "output_alias": "protections",
+                    "iterate_over": {
+                        "source_step": "org_repos",
+                        "array_path": "repositories",
+                        "item_alias": "repo",
+                    },
+                },
+            ],
+            "summary": "Plan where LLM used output_alias in iterate_over.",
+        }
+        text = _wrap_plan(plan_dict)
+        result = parse_plan_from_llm_output(text)
+        assert result.query_plan is not None
+        assert result.query_plan.steps[1].iterate_over.source_step == "step_1"
+
 
 class TestEstimatedToolCalls:
     """estimated_tool_calls calculation."""
@@ -343,7 +421,6 @@ class TestEstimatedToolCalls:
         text = _wrap_plan(plan_dict)
         result = parse_plan_from_llm_output(text)
         plan = result.query_plan
-        # step_1: 1 + 1 (paginate) = 2, step_2: 10 (iterate) + 1 (paginate) = 11
         assert plan.estimated_tool_calls == 13
 
     def test_paginate_false_no_extra(self):
@@ -351,8 +428,97 @@ class TestEstimatedToolCalls:
         plan_dict["steps"][0]["paginate"] = False
         text = _wrap_plan(plan_dict)
         result = parse_plan_from_llm_output(text)
-        # 1 base call, no pagination extra
         assert result.query_plan.estimated_tool_calls == 1
+
+
+class TestClarificationParse:
+    """Parser correctly handles LLM output with clarification blocks."""
+
+    def test_parses_valid_clarification(self):
+        text = _wrap_clarification(_minimal_clarification())
+        result = parse_plan_from_llm_output(text)
+        assert result.clarification is not None
+        assert result.query_plan is None
+        assert result.error_message is None
+        assert result.clarification.question == "Which AWS account should I query?"
+        assert len(result.clarification.options) == 2
+
+    def test_clarification_id_is_uuid(self):
+        text = _wrap_clarification(_minimal_clarification())
+        result = parse_plan_from_llm_output(text)
+        uuid.UUID(result.clarification.clarification_id)
+
+    def test_clarification_extracts_analysis_text(self):
+        text = _wrap_clarification(_minimal_clarification(), analysis="My reasoning.")
+        result = parse_plan_from_llm_output(text)
+        assert result.analysis_text == "My reasoning."
+
+    def test_clarification_no_options(self):
+        clar = {"question": "What do you want to check?", "allows_free_text": True}
+        text = _wrap_clarification(clar)
+        result = parse_plan_from_llm_output(text)
+        assert result.clarification is not None
+        assert result.clarification.options is None
+        assert result.clarification.allows_free_text is True
+
+    def test_clarification_allows_free_text_defaults_true(self):
+        clar = {"question": "Which one?"}
+        text = _wrap_clarification(clar)
+        result = parse_plan_from_llm_output(text)
+        assert result.clarification.allows_free_text is True
+
+    def test_clarification_normalizes_id_to_option_id(self):
+        """LLM uses 'id' instead of 'option_id' — parser normalizes."""
+        clar = {
+            "question": "Which?",
+            "options": [
+                {"id": "a", "label": "Option A"},
+                {"id": "b", "label": "Option B"},
+            ],
+        }
+        text = _wrap_clarification(clar)
+        result = parse_plan_from_llm_output(text)
+        assert result.clarification.options[0].option_id == "a"
+        assert result.clarification.options[1].option_id == "b"
+
+    def test_clarification_generates_option_ids_if_missing(self):
+        clar = {
+            "question": "Which?",
+            "options": [{"label": "First"}, {"label": "Second"}],
+        }
+        text = _wrap_clarification(clar)
+        result = parse_plan_from_llm_output(text)
+        assert result.clarification.options[0].option_id == "opt_1"
+        assert result.clarification.options[1].option_id == "opt_2"
+
+    def test_both_plan_and_clarification_is_error(self):
+        plan_block = f"---PLAN_START---\n{json.dumps(_minimal_plan())}\n---PLAN_END---"
+        clar_block = f"---CLARIFICATION_START---\n{json.dumps(_minimal_clarification())}\n---CLARIFICATION_END---"
+        text = f"Analysis.\n\n{plan_block}\n\n{clar_block}"
+        result = parse_plan_from_llm_output(text)
+        assert result.query_plan is None
+        assert result.clarification is None
+        assert "both" in result.error_message.lower()
+
+    def test_neither_plan_nor_clarification_is_error(self):
+        text = "Just analysis text, no structured output."
+        result = parse_plan_from_llm_output(text)
+        assert result.query_plan is None
+        assert result.clarification is None
+        assert result.error_message is not None
+
+    def test_malformed_clarification_json(self):
+        text = "Analysis.\n\n---CLARIFICATION_START---\n{bad json}\n---CLARIFICATION_END---"
+        result = parse_plan_from_llm_output(text)
+        assert result.clarification is None
+        assert "Invalid JSON" in result.error_message
+
+    def test_clarification_missing_question(self):
+        clar = {"options": [{"option_id": "a", "label": "A"}]}
+        text = _wrap_clarification(clar)
+        result = parse_plan_from_llm_output(text)
+        assert result.clarification is None
+        assert "no question" in result.error_message.lower()
 
 
 class TestCatalogValidation:
@@ -363,7 +529,6 @@ class TestCatalogValidation:
         result = parse_plan_from_llm_output(text)
         plan = result.query_plan
 
-        # Mutate the plan to reference a tool not in catalog
         plan.steps[0].tool_name = "aws.iam_list_users"
         catalog = _make_catalog()
         errors = validate_plan_against_catalog(plan, catalog)
@@ -382,7 +547,6 @@ class TestCatalogValidation:
         assert "integration_id" in errors[0]
 
     def test_tool_wrong_integration(self):
-        """Tool exists but belongs to a different integration."""
         catalog = ToolCatalog(
             integrations=[
                 CatalogIntegration(
@@ -416,7 +580,6 @@ class TestCatalogValidation:
         text = _wrap_plan(_minimal_plan())
         result = parse_plan_from_llm_output(text)
         plan = result.query_plan
-        # Tool is github.list_repositories but we set integration to AWS
         plan.steps[0].integration_id = "bbbb"
         errors = validate_plan_against_catalog(plan, catalog)
         assert len(errors) > 0

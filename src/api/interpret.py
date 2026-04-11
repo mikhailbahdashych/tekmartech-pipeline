@@ -1,23 +1,29 @@
 """POST /interpret endpoint with real LLM-powered interpretation.
 
 Validates the request, then streams NDJSON events as the LLM analyzes
-the query and produces a structured execution plan.
-Conforms to the /interpret endpoint defined in internal-api.yaml.
+the query and produces a structured execution plan or clarification.
+Supports multi-turn conversation via optional conversation_history.
+Conforms to the /interpret endpoint defined in internal-api.yaml (v1.1.0).
 """
+
+from typing import Annotated, Union
 
 import structlog
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from src.api.streaming import ndjson_stream_response
 from src.config import get_settings
+from src.models.conversation import AssistantTurn, UserTurn
 from src.models.query_plan import QueryPlan
 from src.models.tool_catalog import ToolCatalog
 from src.orchestrator.interpret_orchestrator import interpret_stream
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
+
+ConversationTurn = Annotated[Union[AssistantTurn, UserTurn], Field(discriminator="role")]
 
 
 class InterpretRequest(BaseModel):
@@ -28,12 +34,14 @@ class InterpretRequest(BaseModel):
         query_text: The user's natural language question.
         tool_catalog: Filtered set of available MCP tools.
         query_plan_templates: Optional verified plan templates.
+        conversation_history: Previous turns for multi-turn interpretation.
     """
 
     query_id: str
     query_text: str
     tool_catalog: ToolCatalog
     query_plan_templates: list[QueryPlan] | None = None
+    conversation_history: list[ConversationTurn] | None = None
 
 
 def _catalog_has_tools(request: InterpretRequest) -> bool:
@@ -139,5 +147,6 @@ async def interpret(request: Request) -> JSONResponse:
             tool_catalog=interpret_request.tool_catalog,
             provider=provider,
             settings=settings,
+            conversation_history=interpret_request.conversation_history,
         )
     )

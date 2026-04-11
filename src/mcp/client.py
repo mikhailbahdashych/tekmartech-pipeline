@@ -78,11 +78,35 @@ class MCPClient:
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
-        """Close the session and terminate the server process."""
-        if self._session_cm:
-            await self._session_cm.__aexit__(exc_type, exc_val, exc_tb)
-        if self._stdio_cm:
-            await self._stdio_cm.__aexit__(exc_type, exc_val, exc_tb)
+        """Close the session and terminate the server process.
+
+        The MCP SDK's stdio_client uses anyio task groups internally.
+        If cleanup runs in a different async task than __aenter__ (e.g.,
+        after HTTP client disconnect or generator GC), anyio raises
+        RuntimeError about cancel scope mismatch. This is harmless —
+        the subprocess is killed regardless — so we catch and log it.
+        """
+        try:
+            if self._session_cm:
+                await self._session_cm.__aexit__(exc_type, exc_val, exc_tb)
+        except (RuntimeError, BaseExceptionGroup) as exc:
+            logger.debug(
+                "MCP session cleanup interrupted by task cancellation",
+                action="mcp_disconnect",
+                server_type=self._config.server_type,
+                error=str(exc),
+            )
+
+        try:
+            if self._stdio_cm:
+                await self._stdio_cm.__aexit__(exc_type, exc_val, exc_tb)
+        except (RuntimeError, BaseExceptionGroup) as exc:
+            logger.debug(
+                "MCP stdio cleanup interrupted by task cancellation",
+                action="mcp_disconnect",
+                server_type=self._config.server_type,
+                error=str(exc),
+            )
 
         logger.debug(
             "MCP server disconnected",
